@@ -1,3 +1,6 @@
+# Braindecoder. Tries to turn EDF EEG files to Images. Notice, only 1 epoch. 
+# Perhaps too big dimensions in the latent space. (256)
+
 # =======================
 # Imports
 # =======================
@@ -1277,39 +1280,35 @@ class Trainer:
         self.image_encoder.eval()
         self.model.modality_alignment.eval()
         val_loss = 0.0
-        n_valid_batches = 0
         
         with torch.no_grad():
             for eeg_batch, image_batch, _ in tqdm(val_loader, desc='Validation', leave=False):
-                try:
-                    eeg_batch = eeg_batch.to(self.device)
-                    image_batch = image_batch.to(self.device)
-                    
-                    generated_images, eeg_features, image_features = self.model(eeg_batch, image_batch)
-                    encoded_images = self.image_encoder(image_batch)
-                    
-                    # Add checks for invalid values
-                    if torch.isnan(eeg_features).any() or torch.isnan(encoded_images).any():
-                        continue
-                        
-                    loss, _ = self.contrastive_loss(eeg_features, encoded_images)
-                    encoder_alignment_loss = F.mse_loss(encoded_images, image_features)
-                    
-                    # Skip batch if losses are invalid
-                    if torch.isnan(loss) or torch.isnan(encoder_alignment_loss):
-                        continue
-                        
-                    total_loss = loss + encoder_alignment_loss
-                    
-                    if not torch.isnan(total_loss):
-                        val_loss += total_loss.item()
-                        n_valid_batches += 1
-                        
-                except Exception as e:
-                    logger.warning(f"Error in validation batch: {str(e)}")
-                    continue
-                    
-        return val_loss / max(n_valid_batches, 1)  # Avoid division by zero
+                eeg_batch = eeg_batch.to(self.device)
+                image_batch = image_batch.to(self.device)
+                
+                # Forward pass
+                generated_images, eeg_features, image_features = self.model(eeg_batch, image_batch)
+                encoded_images = self.image_encoder(image_batch)
+                
+                # Compute contrastive loss
+                loss, _ = self.contrastive_loss(eeg_features, encoded_images)
+                encoder_alignment_loss = F.mse_loss(encoded_images, image_features)
+                
+                # Adversarial loss
+                domain_labels_eeg = torch.ones(eeg_features.size(0), 1).to(self.device)
+                domain_labels_image = torch.zeros(image_features.size(0), 1).to(self.device)
+                domain_pred_eeg = self.model.modality_alignment(eeg_features)
+                domain_pred_image = self.model.modality_alignment(encoded_images)
+                adversarial_loss_eeg = F.binary_cross_entropy(domain_pred_eeg, domain_labels_eeg)
+                adversarial_loss_image = F.binary_cross_entropy(domain_pred_image, domain_labels_image)
+                adversarial_loss = adversarial_loss_eeg + adversarial_loss_image
+                
+                # Total loss
+                total_loss = loss + encoder_alignment_loss + adversarial_loss
+                
+                val_loss += total_loss.item()
+                
+        return val_loss / len(val_loader)
     
     def train(self, train_loader, val_loader):
         train_losses = []
@@ -1451,8 +1450,19 @@ class ResultAnalyzer:
         # Then convert to tensor
         return F.mse_loss(torch.tensor(generated_array), 
                         torch.tensor(target_array)).item()
-   
-   
+    
+    def _compute_ssim(self, generated, target):
+        """Compute Structural Similarity Index"""
+        from skimage.metrics import structural_similarity as compare_ssim
+        ssim_values = []
+        for gen, tgt in zip(generated, target):
+            # Convert to grayscale for SSIM
+            gen_gray = cv2.cvtColor(gen.transpose(1, 2, 0), cv2.COLOR_RGB2GRAY)
+            tgt_gray = cv2.cvtColor(tgt.transpose(1, 2, 0), cv2.COLOR_RGB2GRAY)
+            ssim, _ = compare_ssim(gen_gray, tgt_gray, full=True)
+            ssim_values.append(ssim)
+        return np.mean(ssim_values)
+    
     def _compute_ssim(self, generated, target):
         """Compute Structural Similarity Index"""
         from skimage.metrics import structural_similarity as compare_ssim
@@ -2103,7 +2113,7 @@ def train_and_extract_latents(config: Config, project_paths: ProjectPaths):
     np.save(project_paths.get_latent_path('cifar10_labels'), labels)
     logger.info(f"Latent vectors and labels saved to '{project_paths.latents_dir}'")
     
-    return vae, latents, labels
+    return latents, labels
 
 # =======================
 # Brain Decoder GUI
@@ -2121,7 +2131,6 @@ class BrainDecoderGUI:
         self.results_manager = results_manager  # Store the results manager
         self.image_encoder = image_encoder  # Image encoder for analysis
         self.image_queue = queue.Queue(maxsize=100)
-        self.sleep_stages = []  # Initialize empty list
         
         # Create main window
         self.root = tk.Tk()
@@ -2762,7 +2771,7 @@ class BrainDecoderGUI:
                     self.target_images.extend(image_batch.numpy())
             
             # Display results
-            self.display_filtered_grid(self.generated_images)
+            self.display_image_grid(self.generated_images)
             self.notebook.select(1)  # Switch to Generated Images tab
             self.update_status("Images generated successfully")
             
@@ -2858,7 +2867,7 @@ class BrainDecoderGUI:
                             self.generated_images = list(generated_images.cpu().numpy())  # Ensure it's a list
                             self.target_images = list(image_batch.numpy())
                             # Display the generated images
-                            self.display_filtered_grid(self.generated_images)
+                            self.display_image_grid(self.generated_images)
                             self.notebook.select(1)  # Switch to Generated Images tab
                             break  # Just get one batch for the video
                         else:
@@ -3132,38 +3141,26 @@ class BrainDecoderGUI:
             trainer.train(train_loader, val_loader)
             self.update_status("Training completed. Generating images...")
             
-            # Initialize lists to store results
-            self.generated_images = []
-            self.target_images = []
-            self.sleep_stages = []
+            # Generate images for test set
+            test_eeg, test_images, _ = next(iter(train_loader))
             
-            # Generate images from the entire dataset
-            self.model.eval()
+            # Ensure proper dimensions for EEG data
+            if len(test_eeg.shape) == 3:  # If shape is (batch, channels, time)
+                test_eeg = test_eeg.unsqueeze(1)  # Add extra dimension if needed
+            
             with torch.no_grad():
-                for eeg_batch, image_batch, stages in tqdm(train_loader, desc="Generating Images"):
-                    if len(eeg_batch.shape) == 3:  # If shape is (batch, channels, time)
-                        eeg_batch = eeg_batch.unsqueeze(1)  # Add extra dimension if needed
-                    
-                    # Generate images
-                    generated_images, _, _ = self.model(eeg_batch.to(self.device), image_batch.to(self.device))
-                    
-                    # Store results
-                    self.generated_images.extend(generated_images.cpu().numpy())
-                    self.target_images.extend(image_batch.numpy())
-                    self.sleep_stages.extend(stages)
-                    
-                    logger.info(f"Running total: {len(self.generated_images)} images generated")
+                generated_images, _, _ = self.model(test_eeg.to(self.device), test_images.to(self.device))
+                generated_images = generated_images.cpu().numpy()
+                logger.info(f"Generated {len(generated_images)} images with shape {generated_images.shape}")
                 
-            logger.info(f"Final total: Generated {len(self.generated_images)} images with shape {generated_images.shape}")
-            
-            # Store all data together for filtering
-            self.all_generated_images = list(zip(self.generated_images, 
-                                            self.target_images, 
-                                            self.sleep_stages))
+                self.generated_images = list(generated_images)  # Ensure it's a list
+                self.target_images = list(test_images.numpy())
+                
+                logger.info(f"Stored {len(self.generated_images)} images")
             
             # Display generated images and switch to images tab
             def update_display():
-                self.filter_images()  # This will trigger display_filtered_grid
+                self.display_image_grid(self.generated_images)
                 self.notebook.select(1)  # Select Generated Images tab
                 logger.info("Updated display and switched to images tab")
                 
@@ -3173,7 +3170,6 @@ class BrainDecoderGUI:
             self.perform_analysis()
             
             self.update_status("Processing completed successfully.")
-            
         except Exception as e:
             messagebox.showerror("Error", f"An error occurred during training: {str(e)}")
             logger.error(f"Training error: {str(e)}", exc_info=True)
@@ -3181,6 +3177,73 @@ class BrainDecoderGUI:
     def run(self):
         """Start the GUI"""
         self.root.mainloop()
+
+# =======================
+# Test Cases using Pytest
+# =======================
+
+# (Test cases are defined above in the Test Classes section)
+
+# =======================
+# Function Definitions
+# =======================
+
+def train_and_extract_latents(config: Config, project_paths: ProjectPaths):
+    """Train VAE and extract latent vectors"""
+    logger.info("Starting VAE training and latent extraction...")
+    # Adjusted transforms to remove normalization
+    transform = transforms.Compose(config.config['model']['augmentation_transforms'] + [
+        transforms.ToTensor(),
+        # Removed normalization to keep [0,1] range
+    ]) if config.config['model']['use_augmentation'] else transforms.Compose([
+        transforms.ToTensor(),
+        # Removed normalization to keep [0,1] range
+    ])
+    
+    trainset = datasets.CIFAR10(root=str(project_paths.data_dir), train=True,
+                                 download=True, transform=transform)
+    val_size = int(config.config['training']['val_split'] * len(trainset))
+    train_size = len(trainset) - val_size
+    train_dataset, val_dataset = random_split(trainset, [train_size, val_size])
+    
+    train_loader = DataLoader(train_dataset, batch_size=config.config['model']['batch_size'], shuffle=True, num_workers=4)
+    val_loader = DataLoader(val_dataset, batch_size=config.config['model']['batch_size'], shuffle=False, num_workers=4)
+    
+    # Initialize VAE
+    vae = VAE(config).to(config.device)
+    
+    # Initialize TrainerVAE
+    vae_trainer = TrainerVAE(model=vae, device=config.device, project_paths=project_paths, 
+                             train_loader=train_loader, val_loader=val_loader, config=config)
+    vae_trainer.train()
+    
+    # Extract latent vectors from test set
+    logger.info("Extracting latent vectors from test set...")
+    testset = datasets.CIFAR10(root=str(project_paths.data_dir), train=False,
+                                download=True, transform=transform)
+    test_loader = DataLoader(testset, batch_size=config.config['model']['batch_size'], shuffle=False, num_workers=4)
+    
+    vae.eval()
+    all_latents = []
+    all_labels = []
+    
+    with torch.no_grad():
+        for images, labels_batch in tqdm(test_loader, desc="Extracting Latents"):
+            images = images.to(config.device)
+            recon_images, mu, logvar = vae(images)
+            latents = mu.cpu().numpy()
+            all_latents.append(latents)
+            all_labels.append(labels_batch.numpy())
+    
+    latents = np.concatenate(all_latents, axis=0)
+    labels = np.concatenate(all_labels, axis=0)
+    
+    # Save latent vectors and labels
+    np.save(project_paths.get_latent_path('cifar10_latents'), latents)
+    np.save(project_paths.get_latent_path('cifar10_labels'), labels)
+    logger.info(f"Latent vectors and labels saved to '{project_paths.latents_dir}'")
+    
+    return latents, labels
 
 # =======================
 # Main Execution
@@ -3209,6 +3272,7 @@ if __name__ == "__main__":
         logger.info("Preparing CIFAR-10 dataset...")
         transform = transforms.Compose([
             transforms.ToTensor(),
+            # Removed normalization to keep [0,1] range
         ])
         trainset = datasets.CIFAR10(root=str(project_paths.data_dir), train=True,
                                      download=True, transform=transform)
@@ -3224,20 +3288,26 @@ if __name__ == "__main__":
         vae = VAE(config).to(device)
         vae.load_state_dict(torch.load(vae_path, map_location=device))
         vae.eval()
-        # Train VAE and extract latents if needed
-        latents, labels = None, None
     else:
         # Train VAE and extract latents
-        vae, latents, labels = train_and_extract_latents(config, project_paths)
-        # Save the newly trained VAE
-        torch.save(vae.state_dict(), vae_path)
-        logger.info(f"Saved trained VAE model to '{vae_path}'")
-
+        latents, labels = train_and_extract_latents(config, project_paths)
+    
     # Initialize scalers
     scaler_eeg = StandardScaler()
     scaler_latent = StandardScaler()
-
-    # Initialize Pretrained Image Decoder with the loaded or trained VAE
+    
+    # Load VAE model
+    # Note: If VAE was loaded above, no need to train again
+    if not vae_path.exists():
+        # VAE has been trained in train_and_extract_latents
+        # Save the trained VAE
+        torch.save(vae.state_dict(), vae_path)
+        logger.info(f"Saved trained VAE model to '{vae_path}'")
+    else:
+        # VAE was loaded, no action needed
+        pass
+    
+    # Initialize Pretrained Image Decoder
     image_decoder = PretrainedImageDecoder(vae, device=device)
     
     # Initialize BrainDecoderModel

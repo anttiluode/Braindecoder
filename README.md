@@ -1,6 +1,7 @@
 # Braindecoder
 
-(Dont even try to install, it is a mess. Too long for the AIs to understand. They fix one thing and break another.)
+(Dont even try to install, it is a mess. Too long for the AIs to understand. They fix one thing and break another.
+Currently you have to start the code twice, first it errors after training vae.. )
 
 Video demo:
 

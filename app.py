@@ -1277,35 +1277,39 @@ class Trainer:
         self.image_encoder.eval()
         self.model.modality_alignment.eval()
         val_loss = 0.0
+        n_valid_batches = 0
         
         with torch.no_grad():
             for eeg_batch, image_batch, _ in tqdm(val_loader, desc='Validation', leave=False):
-                eeg_batch = eeg_batch.to(self.device)
-                image_batch = image_batch.to(self.device)
-                
-                # Forward pass
-                generated_images, eeg_features, image_features = self.model(eeg_batch, image_batch)
-                encoded_images = self.image_encoder(image_batch)
-                
-                # Compute contrastive loss
-                loss, _ = self.contrastive_loss(eeg_features, encoded_images)
-                encoder_alignment_loss = F.mse_loss(encoded_images, image_features)
-                
-                # Adversarial loss
-                domain_labels_eeg = torch.ones(eeg_features.size(0), 1).to(self.device)
-                domain_labels_image = torch.zeros(image_features.size(0), 1).to(self.device)
-                domain_pred_eeg = self.model.modality_alignment(eeg_features)
-                domain_pred_image = self.model.modality_alignment(encoded_images)
-                adversarial_loss_eeg = F.binary_cross_entropy(domain_pred_eeg, domain_labels_eeg)
-                adversarial_loss_image = F.binary_cross_entropy(domain_pred_image, domain_labels_image)
-                adversarial_loss = adversarial_loss_eeg + adversarial_loss_image
-                
-                # Total loss
-                total_loss = loss + encoder_alignment_loss + adversarial_loss
-                
-                val_loss += total_loss.item()
-                
-        return val_loss / len(val_loader)
+                try:
+                    eeg_batch = eeg_batch.to(self.device)
+                    image_batch = image_batch.to(self.device)
+                    
+                    generated_images, eeg_features, image_features = self.model(eeg_batch, image_batch)
+                    encoded_images = self.image_encoder(image_batch)
+                    
+                    # Add checks for invalid values
+                    if torch.isnan(eeg_features).any() or torch.isnan(encoded_images).any():
+                        continue
+                        
+                    loss, _ = self.contrastive_loss(eeg_features, encoded_images)
+                    encoder_alignment_loss = F.mse_loss(encoded_images, image_features)
+                    
+                    # Skip batch if losses are invalid
+                    if torch.isnan(loss) or torch.isnan(encoder_alignment_loss):
+                        continue
+                        
+                    total_loss = loss + encoder_alignment_loss
+                    
+                    if not torch.isnan(total_loss):
+                        val_loss += total_loss.item()
+                        n_valid_batches += 1
+                        
+                except Exception as e:
+                    logger.warning(f"Error in validation batch: {str(e)}")
+                    continue
+                    
+        return val_loss / max(n_valid_batches, 1)  # Avoid division by zero
     
     def train(self, train_loader, val_loader):
         train_losses = []
@@ -2128,6 +2132,7 @@ class BrainDecoderGUI:
         self.results_manager = results_manager  # Store the results manager
         self.image_encoder = image_encoder  # Image encoder for analysis
         self.image_queue = queue.Queue(maxsize=100)
+        self.sleep_stages = []  # Initialize empty list
         
         # Create main window
         self.root = tk.Tk()
@@ -2768,7 +2773,7 @@ class BrainDecoderGUI:
                     self.target_images.extend(image_batch.numpy())
             
             # Display results
-            self.display_image_grid(self.generated_images)
+            self.display_filtered_grid(self.generated_images)
             self.notebook.select(1)  # Switch to Generated Images tab
             self.update_status("Images generated successfully")
             
@@ -2864,7 +2869,7 @@ class BrainDecoderGUI:
                             self.generated_images = list(generated_images.cpu().numpy())  # Ensure it's a list
                             self.target_images = list(image_batch.numpy())
                             # Display the generated images
-                            self.display_image_grid(self.generated_images)
+                            self.display_filtered_grid(self.generated_images)
                             self.notebook.select(1)  # Switch to Generated Images tab
                             break  # Just get one batch for the video
                         else:
@@ -3157,7 +3162,7 @@ class BrainDecoderGUI:
             
             # Display generated images and switch to images tab
             def update_display():
-                self.display_image_grid(self.generated_images)
+                self.display_filtered_grid(self.generated_images)
                 self.notebook.select(1)  # Select Generated Images tab
                 logger.info("Updated display and switched to images tab")
                 

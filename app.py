@@ -1,3 +1,5 @@
+# Dream2Imagev7.py
+
 # =======================
 # Imports
 # =======================
@@ -88,7 +90,7 @@ class Config:
                 'stride': 32,
                 'batch_size': 16,   # Reduced batch size for better stability
                 'learning_rate': 1e-4,  # Reduced learning rate
-                'epochs': 5,
+                'epochs': 15,
                 'hidden_dims': [64, 128, 256, 512],  # Increased network capacity
                 'optimizer_choice': 'AdamW',  # Changed to AdamW
                 'scheduler_step_size': 20,
@@ -109,8 +111,6 @@ class Config:
             },
             'processing': {
                 'eeg_channels': 'all',  # 'all' or list of channel indices
-                'required_channels': ['EEG'],  # Add minimum required channel types
-                'excluded_channels': ['EOG'],  # Channels to exclude by default
                 'min_freq': 1.0,
                 'max_freq': 45.0,
                 'normalize': True
@@ -238,68 +238,54 @@ class EEGExtractor:
         else:
             logger.info("Using all channels")
         
-        # Ensure sleep stages are detected immediately after loading data
+        # Detect sleep stages using selected channels
         data = self.raw.get_data()
-        if self.sleep_stages is None:
-            self.sleep_stages = self._detect_sleep_stages(data)
-            if self.sleep_stages is None or len(self.sleep_stages) == 0:
-                logger.error("No sleep stages detected")
-                raise ValueError("Failed to detect sleep stages")
-
-        return self.raw
-
+        self.sleep_stages = self._detect_sleep_stages(data)
+    
     def _detect_sleep_stages(self, data):
         """Enhanced sleep stage detection using selected channels"""
-        if data is None or len(data) == 0:
-            logger.error("No data available for sleep stage detection")
-            return None
-
-        try:
-            stages = []
-            window_size = int(self.raw.info['sfreq'] * 30)  # 30-second windows
+        stages = []
+        window_size = int(self.raw.info['sfreq'] * 30)  # 30-second windows
+        
+        for start in range(0, data.shape[1], window_size):
+            window = data[:, start:start + window_size]
+            if window.shape[1] < window_size:
+                break  # Discard incomplete window
+                
+            # Compute features for each channel
+            channel_features = []
+            for ch_idx in range(window.shape[0]):
+                freqs, psd = welch(window[ch_idx], fs=self.raw.info['sfreq'])
+                
+                # Frequency bands
+                delta = np.mean(psd[(freqs >= 0.5) & (freqs <= 4)])
+                theta = np.mean(psd[(freqs >= 4) & (freqs <= 8)])
+                alpha = np.mean(psd[(freqs >= 8) & (freqs <= 13)])
+                beta = np.mean(psd[(freqs >= 13) & (freqs <= 30)])
+                
+                channel_features.append({
+                    'delta': delta,
+                    'theta': theta,
+                    'alpha': alpha,
+                    'beta': beta,
+                    'delta_theta_ratio': delta/theta if theta > 0 else 0,
+                    'theta_alpha_ratio': theta/alpha if alpha > 0 else 0
+                })
             
-            for start in range(0, data.shape[1], window_size):
-                window = data[:, start:start + window_size]
-                if window.shape[1] < window_size:
-                    break  # Discard incomplete window
-                    
-                # Compute features for each channel
-                channel_features = []
-                for ch_idx in range(window.shape[0]):
-                    freqs, psd = welch(window[ch_idx], fs=self.raw.info['sfreq'])
-                    
-                    # Frequency bands
-                    delta = np.mean(psd[(freqs >= 0.5) & (freqs <= 4)])
-                    theta = np.mean(psd[(freqs >= 4) & (freqs <= 8)])
-                    alpha = np.mean(psd[(freqs >= 8) & (freqs <= 13)])
-                    beta = np.mean(psd[(freqs >= 13) & (freqs <= 30)])
-                    
-                    channel_features.append({
-                        'delta': delta,
-                        'theta': theta,
-                        'alpha': alpha,
-                        'beta': beta,
-                        'delta_theta_ratio': delta/theta if theta > 0 else 0,
-                        'theta_alpha_ratio': theta/alpha if alpha > 0 else 0
-                    })
+            # Combine channel features for stage classification
+            avg_delta_theta = np.mean([f['delta_theta_ratio'] for f in channel_features])
+            avg_theta_alpha = np.mean([f['theta_alpha_ratio'] for f in channel_features])
+            
+            # Classify stage
+            if avg_delta_theta > 2:
+                stages.append('deep_sleep')
+            elif avg_theta_alpha > 1.5:
+                stages.append('light_sleep')
+            else:
+                stages.append('rem')
                 
-                # Combine channel features for stage classification
-                avg_delta_theta = np.mean([f['delta_theta_ratio'] for f in channel_features])
-                avg_theta_alpha = np.mean([f['theta_alpha_ratio'] for f in channel_features])
-                
-                # Classify stage
-                if avg_delta_theta > 2:
-                    stages.append('deep_sleep')
-                elif avg_theta_alpha > 1.5:
-                    stages.append('light_sleep')
-                else:
-                    stages.append('rem')
-                    
-            logger.info(f"Detected sleep stages: {set(stages)} with counts {dict((stage, stages.count(stage)) for stage in set(stages))}")
-            return stages
-        except Exception as e:
-            logger.error(f"Error in sleep stage detection: {str(e)}")
-            raise
+        logger.info(f"Detected sleep stages: {set(stages)} with counts { {stage: stages.count(stage) for stage in set(stages)} }")
+        return stages
     
     def extract_segments(self, save_dir):
         """Extract and save EEG segments with metadata"""
@@ -2058,8 +2044,7 @@ def test_end_to_end():
 def train_and_extract_latents(config: Config, project_paths: ProjectPaths):
     """Train VAE and extract latent vectors"""
     logger.info("Starting VAE training and latent extraction...")
-    
-    # Define data transformations
+    # Adjusted transforms to remove normalization
     transform = transforms.Compose(config.config['model']['augmentation_transforms'] + [
         transforms.ToTensor(),
         # Removed normalization to keep [0,1] range
@@ -2068,24 +2053,24 @@ def train_and_extract_latents(config: Config, project_paths: ProjectPaths):
         # Removed normalization to keep [0,1] range
     ])
     
-    # Load CIFAR-10 training data
     trainset = datasets.CIFAR10(root=str(project_paths.data_dir), train=True,
                                  download=True, transform=transform)
     val_size = int(config.config['training']['val_split'] * len(trainset))
     train_size = len(trainset) - val_size
     train_dataset, val_dataset = random_split(trainset, [train_size, val_size])
     
-    # Create data loaders
     train_loader = DataLoader(train_dataset, batch_size=config.config['model']['batch_size'], shuffle=True, num_workers=4)
     val_loader = DataLoader(val_dataset, batch_size=config.config['model']['batch_size'], shuffle=False, num_workers=4)
     
-    # Initialize and train the VAE
+    # Initialize VAE
     vae = VAE(config).to(config.device)
+    
+    # Initialize TrainerVAE
     vae_trainer = TrainerVAE(model=vae, device=config.device, project_paths=project_paths, 
                              train_loader=train_loader, val_loader=val_loader, config=config)
     vae_trainer.train()
     
-    # Extract latent vectors from the test set
+    # Extract latent vectors from test set
     logger.info("Extracting latent vectors from test set...")
     testset = datasets.CIFAR10(root=str(project_paths.data_dir), train=False,
                                 download=True, transform=transform)
@@ -2103,7 +2088,6 @@ def train_and_extract_latents(config: Config, project_paths: ProjectPaths):
             all_latents.append(latents)
             all_labels.append(labels_batch.numpy())
     
-    # Concatenate all latents and labels
     latents = np.concatenate(all_latents, axis=0)
     labels = np.concatenate(all_labels, axis=0)
     
@@ -2112,8 +2096,7 @@ def train_and_extract_latents(config: Config, project_paths: ProjectPaths):
     np.save(project_paths.get_latent_path('cifar10_labels'), labels)
     logger.info(f"Latent vectors and labels saved to '{project_paths.latents_dir}'")
     
-    return latents, labels, vae  # Return the trained VAE
-
+    return latents, labels
 
 # =======================
 # Brain Decoder GUI
@@ -2143,306 +2126,148 @@ class BrainDecoderGUI:
         # For generated images
         self.generated_images = []
         self.target_images = []
-        
-        # Initialize sleep_stages
-        self.sleep_stages = []
-        
-        # Initialize all_generated_images for filtering
-        self.all_generated_images = []
     
-    def _detect_sleep_stages(self, data):
-        """Enhanced sleep stage detection using selected channels"""
-        stages = []
-        window_size = int(self.raw.info['sfreq'] * 30)  # 30-second windows
+    def _get_or_generate_latents(self):
+        """Get existing latents or generate new ones"""
+        # Try to load existing latents
+        latents_path = self.paths.get_latent_path('cifar10_latents')
         
-        for start in range(0, data.shape[1], window_size):
-            window = data[:, start:start + window_size]
-            if window.shape[1] < window_size:
-                break  # Discard incomplete window
-                
-            # Compute features for each channel
-            channel_features = []
-            for ch_idx in range(window.shape[0]):
-                freqs, psd = welch(window[ch_idx], fs=self.raw.info['sfreq'])
-                
-                # Frequency bands
-                delta = np.mean(psd[(freqs >= 0.5) & (freqs <= 4)])
-                theta = np.mean(psd[(freqs >= 4) & (freqs <= 8)])
-                alpha = np.mean(psd[(freqs >= 8) & (freqs <= 13)])
-                beta = np.mean(psd[(freqs >= 13) & (freqs <= 30)])
-                
-                channel_features.append({
-                    'delta': delta,
-                    'theta': theta,
-                    'alpha': alpha,
-                    'beta': beta,
-                    'delta_theta_ratio': delta/theta if theta > 0 else 0,
-                    'theta_alpha_ratio': theta/alpha if alpha > 0 else 0
-                })
+        if not latents_path.exists():
+            logger.info("Latent vectors not found. Generating new latents...")
             
-            # Combine channel features for stage classification
-            avg_delta_theta = np.mean([f['delta_theta_ratio'] for f in channel_features])
-            avg_theta_alpha = np.mean([f['theta_alpha_ratio'] for f in channel_features])
-            
-            # Classify stage
-            if avg_delta_theta > 2:
-                stages.append('deep_sleep')
-            elif avg_theta_alpha > 1.5:
-                stages.append('light_sleep')
-            else:
-                stages.append('rem')
-                
-        logger.info(f"Detected sleep stages: {set(stages)} with counts { {stage: stages.count(stage) for stage in set(stages)} }")
-        return stages
-    
-    def extract_eeg_data(self):
-        """Extract and organize EEG data segments"""
-        edf_file = self.file_entry.get()
-        channels = self.channels_var.get()
-        
-        if not edf_file:
-            messagebox.showerror("Error", "Please select an EDF file.")
-            return
-            
-        try:
-            self.update_status("Extracting EEG data...")
-            extractor = EEGExtractor(edf_file, selected_channels=channels)
-            extractor.load_edf()
-            
-            # Initialize self.raw with the loaded EEG data
-            self.raw = extractor.raw
-            
-            save_dir = self.paths.data_dir / 'processed'
-            extractor.extract_segments(save_dir)
-            
-            # Detect sleep stages
-            eeg_data = self.raw.get_data()  # Accessing the initialized self.raw
-            self.sleep_stages = self._detect_sleep_stages(eeg_data)
-            
-            # Create latent pairs if VAE is available
+            # Get or load VAE
             vae_path = self.paths.get_model_path('vae_best')
-            if vae_path.exists():
+            if not vae_path.exists():
+                # Train VAE and extract latents
+                latents, _ = train_and_extract_latents(self.config, self.paths)
+            else:
+                # Load existing VAE and generate latents
                 vae = VAE(self.config).to(self.device)
                 vae.load_state_dict(torch.load(vae_path, map_location=self.device))
                 vae.eval()
-                extractor.create_latent_pairs(save_dir, vae)
-            else:
-                logger.warning(f"VAE model not found at '{vae_path}'. Latent pairs will not be created.")
-            
-            self.update_status("EEG data extracted and organized successfully")
-            
-            # Update visualization
-            self.plot_stage_distribution(save_dir)
-            
-        except Exception as e:
-            messagebox.showerror("Error", f"Failed to extract EEG data: {str(e)}")
-            logger.error(f"EEG extraction error: {str(e)}", exc_info=True)
-
-        # Plot EEG data
-        try:
-            data = self.raw.get_data()
-            self.plot_eeg(data)
-        except Exception as e:
-            logger.error(f"Error plotting EEG data: {str(e)}", exc_info=True)
-
-    
-    def display_image_grid(self, images, rows=4, cols=4):
-        """Display grid of images with pagination"""
-        # Clear existing grid
-        for widget in self.scrollable_frame.winfo_children():
-            widget.destroy()
-
-        if not images:
-            logger.warning("No images to display")
-            label = ttk.Label(self.scrollable_frame, text="No images generated yet")
-            label.pack(pady=20)
-            return
-
-        # Calculate pagination
-        self.images_per_page = rows * cols
-        current_page = self.page_var.get()
-        total_pages = (len(images) + self.images_per_page - 1) // self.images_per_page
-
-        # Update page display
-        self.page_label.config(text=f"Page {current_page} of {total_pages}")
-        self.counter_label.config(text=f"Total Images: {len(images)}")
-
-        # Calculate start and end indices for current page
-        start_idx = (current_page - 1) * self.images_per_page
-        end_idx = min(start_idx + self.images_per_page, len(images))
-
-        # Create grid for current page
-        for i, img in enumerate(images[start_idx:end_idx]):
-            frame = ttk.Frame(self.scrollable_frame)
-            frame.grid(row=i//cols, column=i%cols, padx=5, pady=5)
-
-            try:
-                # Image index label
-                idx_label = ttk.Label(frame, text=f"Image {start_idx + i + 1}")
-                idx_label.pack()
-
-                # Convert to PhotoImage
-                if img.shape[0] == 3:  # Channel first format (3, H, W)
-                    img_np = (img.transpose(1, 2, 0) * 255).clip(0, 255).astype(np.uint8)
-                    img_pil = Image.fromarray(img_np)
-                elif img.shape[0] == 1:  # Single channel
-                    img_np = (img.squeeze(0) * 255).clip(0, 255).astype(np.uint8)
-                    img_pil = Image.fromarray(img_np, mode='L')
-                else:
-                    logger.warning(f"Unexpected image shape: {img.shape}")
-                    continue
-
-                img_pil = img_pil.resize((100, 100))
-                img_tk = ImageTk.PhotoImage(img_pil)
-
-                # Display image
-                label = ttk.Label(frame, image=img_tk)
-                label.image = img_tk  # Keep reference
-                label.pack()
-
-            except Exception as e:
-                logger.error(f"Error displaying image {start_idx + i}: {str(e)}")
-                error_label = ttk.Label(frame, text=f"Error: {str(e)}")
-                error_label.pack()
-
-        # Force update
-        self.scrollable_frame.update_idletasks()
-
-    def display_filtered_grid(self, filtered_images, rows=4, cols=4):
-        """Display grid of filtered images with pagination"""
-        # Debug logging
-        logger.info(f"Total images: {len(filtered_images)}")  # Changed from images to filtered_images
-
-        # Clear existing grid
-        for widget in self.scrollable_frame.winfo_children():
-            widget.destroy()
-
-        if not filtered_images:  # Changed from images to filtered_images
-            logger.warning("No images to display")
-            label = ttk.Label(self.scrollable_frame, text="No images generated yet")
-            label.pack(pady=20)
-            return
-
-        # Calculate pagination
-        self.images_per_page = rows * cols
-        current_page = self.page_var.get()
-        total_pages = (len(filtered_images) + self.images_per_page - 1) // self.images_per_page
-
-        # Update page display
-        self.page_label.config(text=f"Page {current_page} of {total_pages}")
-        self.counter_label.config(text=f"Total Images: {len(filtered_images)}")
-
-        # Calculate start and end indices for current page
-        start_idx = (current_page - 1) * self.images_per_page
-        end_idx = min(start_idx + self.images_per_page, len(filtered_images))
-
-        # Create grid for current page
-        for i, img in enumerate(filtered_images[start_idx:end_idx]):
-            frame = ttk.Frame(self.scrollable_frame)
-            frame.grid(row=i//cols, column=i%cols, padx=5, pady=5)
-
-            try:
-                # Image index label
-                idx_label = ttk.Label(frame, text=f"Image {start_idx + i + 1}")
-                idx_label.pack()
-
-                # Convert to PhotoImage
-                if img.shape[0] == 3:  # Channel first format (3, H, W)
-                    img_np = (img.transpose(1, 2, 0) * 255).clip(0, 255).astype(np.uint8)
-                    img_pil = Image.fromarray(img_np)
-                elif img.shape[0] == 1:  # Single channel
-                    img_np = (img.squeeze(0) * 255).clip(0, 255).astype(np.uint8)
-                    img_pil = Image.fromarray(img_np, mode='L')
-                else:
-                    logger.warning(f"Unexpected image shape: {img.shape}")
-                    continue
-
-                img_pil = img_pil.resize((100, 100))
-                img_tk = ImageTk.PhotoImage(img_pil)
-
-                # Display image
-                label = ttk.Label(frame, image=img_tk)
-                label.image = img_tk  # Keep reference
-                label.pack()
-
-            except Exception as e:
-                logger.error(f"Error displaying image {start_idx + i}: {str(e)}")
-                error_label = ttk.Label(frame, text=f"Error: {str(e)}")
-                error_label.pack()
-
-        # Force update
-        self.scrollable_frame.update_idletasks()
-
-    def update_display(self):
-        """Update display in the GUI"""
-        try:
-            self.display_image_grid(self.generated_images)
-            self.notebook.select(1)  # Switch to Generated Images tab
-            logger.info("Updated display and switched to images tab")
-        except AttributeError as e:
-            logger.error(f"Failed to update display: {str(e)}")
-            messagebox.showerror("Error", f"Failed to update display: {str(e)}")
-    
-    def plot_stage_distribution(self, processed_dir):
-        """Plot distribution of sleep stages"""
-        try:
-            with open(processed_dir / 'eeg_metadata.json', 'r') as f:
-                metadata = json.load(f)
                 
-            stages = metadata['stages']
-            fig = plt.Figure(figsize=(6, 4))
-            ax = fig.add_subplot(111)
-            ax.bar(stages.keys(), stages.values())
-            ax.set_title('Sleep Stage Distribution')
-            ax.set_ylabel('Number of Segments')
-            
-            # Update analysis tab
+                # Generate latents from generated images
+                with torch.no_grad():
+                    images_tensor = torch.tensor(self.generated_images).to(self.device).float()
+                    mu, logvar, _ = vae.encode(images_tensor)
+                    latents = mu.cpu().numpy()
+                    
+            # Save latents
+            np.save(latents_path, latents)
+            logger.info(f"Generated and saved latent vectors to '{latents_path}'")
+        else:
+            # Load existing latents
+            latents = np.load(latents_path)
+            logger.info(f"Loaded existing latents from '{latents_path}'")
+        
+        return latents
+
+    def update_visualizations(self, analysis, session_dir):
+        """Update visualizations in the analysis tab based on analysis results"""
+        try:
+            # Clear existing visualizations
             for widget in self.analysis_frame.winfo_children():
                 widget.destroy()
+                
+            # Create figure with multiple subplots
+            fig = Figure(figsize=(12, 8))
+            
+            # Latent space visualization (if available)
+            if analysis.get('clustering') and analysis['clustering'].get('k_star_distribution'):
+                ax1 = fig.add_subplot(221)
+                k_star = analysis['clustering']['k_star_distribution']
+                ax1.hist(k_star['values'], bins=50)
+                ax1.axvline(k_star['mean'], color='r', linestyle='--',
+                        label=f"Mean: {k_star['mean']:.3f}")
+                ax1.set_title("k* Distribution")
+                ax1.set_xlabel('k*')
+                ax1.set_ylabel('Count')
+                ax1.legend()
+            
+            # Correlation matrix (if available)
+            if analysis.get('alignment') and analysis['alignment'].get('correlation_matrix') is not None:
+                ax2 = fig.add_subplot(222)
+                correlation = np.array(analysis['alignment']['correlation_matrix'])
+                im = ax2.imshow(correlation, cmap='coolwarm', aspect='auto')
+                ax2.set_title('EEG-Image Latent Space Correlation')
+                fig.colorbar(im, ax=ax2)  # Use fig.colorbar instead of plt.colorbar
+                
+                # Add correlation stats if available
+                if analysis['alignment'].get('mean_correlation') is not None:
+                    ax2.set_xlabel(f'Mean Corr: {analysis["alignment"]["mean_correlation"]:.3f}')
+                if analysis['alignment'].get('max_correlation') is not None:
+                    ax2.set_ylabel(f'Max Corr: {analysis["alignment"]["max_correlation"]:.3f}')
+            
+            # Distribution statistics (if available)
+            if analysis.get('distribution'):
+                ax3 = fig.add_subplot(223)
+                dist = analysis['distribution']
+                if isinstance(dist.get('mean'), list):
+                    ax3.plot(dist['mean'], label='Mean')
+                    ax3.plot(dist['std'], label='Std')
+                    ax3.set_title('Latent Distribution Statistics')
+                    ax3.legend()
+            
+            # Sleep stage distribution (if available)
+            if hasattr(self, 'sleep_stages') and self.sleep_stages:
+                ax4 = fig.add_subplot(224)
+                stage_counts = {}
+                for stage in self.sleep_stages:
+                    stage_counts[stage] = stage_counts.get(stage, 0) + 1
+                
+                # Create bar plot
+                bars = ax4.bar(stage_counts.keys(), stage_counts.values())
+                ax4.set_title('Sleep Stage Distribution')
+                
+                # Add value labels on top of bars
+                for bar in bars:
+                    height = bar.get_height()
+                    ax4.annotate(f'{int(height)}',
+                                xy=(bar.get_x() + bar.get_width()/2, height),
+                                xytext=(0, 3),  # 3 points vertical offset
+                                textcoords="offset points",
+                                ha='center', va='bottom')
+                
+                # Rotate labels for better readability
+                ax4.tick_params(axis='x', rotation=45)
+            
+            # Adjust layout and display
+            fig.tight_layout()
+            
+            # Create canvas and display
             canvas = FigureCanvasTkAgg(fig, self.analysis_frame)
             canvas.draw()
             canvas.get_tk_widget().pack(fill=tk.BOTH, expand=True)
+            
+            # Switch to analysis tab
+            self.notebook.select(2)  # Index 2 should be the analysis tab
+            
+            # Add text summary
+            if analysis.get('alignment'):
+                summary_text = f"Analysis Summary:\n"
+                if 'n_samples' in analysis['alignment']:
+                    summary_text += f"Samples analyzed: {analysis['alignment']['n_samples']}\n"
+                if 'eeg_dim' in analysis['alignment']:
+                    summary_text += f"EEG latent dimensions: {analysis['alignment']['eeg_dim']}\n"
+                if 'image_dim' in analysis['alignment']:
+                    summary_text += f"Image latent dimensions: {analysis['alignment']['image_dim']}\n"
+                    
+                summary_label = ttk.Label(self.analysis_frame, text=summary_text, justify=tk.LEFT)
+                summary_label.pack(pady=10)
+            
+            self.update_status("Analysis visualizations updated")
+            
         except Exception as e:
-            logger.error(f"Error plotting sleep stage distribution: {str(e)}", exc_info=True)
-            self.update_status("Error plotting sleep stage distribution")
-    
-    def plot_eeg(self, eeg_data):
-        """Plot EEG signal in the EEG tab"""
-        self.eeg_fig.clear()
-        ax = self.eeg_fig.add_subplot(111)
-        ax.plot(eeg_data.T)
-        channels = self.config.config['processing']['eeg_channels']
-        if channels == 'all':
-            channel_info = "All Channels"
-        else:
-            channel_info = f"Channels: {', '.join(map(str, channels))}"
-        ax.set_title(f'EEG Signal ({channel_info})')
-        ax.set_xlabel('Time')
-        ax.set_ylabel('Amplitude')
-        self.eeg_canvas.draw()
-    
-    def filter_images(self):
-        """Filter images based on selected sleep stage"""
-        if not hasattr(self, 'all_generated_images'):
-            return
-        
-        selected_stage = self.stage_var.get()
-        if selected_stage == "all":
-            filtered_images = self.all_generated_images
-        else:
-            filtered_images = [img_data for img_data in self.all_generated_images 
-                            if img_data[2] == selected_stage]
-        
-        # Update counts
-        total_count = len(filtered_images)
-        self.count_label.config(text=f"Showing {total_count} images")
-        
-        # Reset pagination
-        self.page_var.set(1)
-        
-        # Display filtered images
-        self.display_filtered_grid([img for img, _, _ in filtered_images])
-    
+            logger.error(f"Error updating visualizations: {str(e)}", exc_info=True)
+            self.update_status("Error updating visualizations")
+
+    def _encode_generated_images(self):
+        """Encode generated images to get their latent representations"""
+        self.image_encoder.eval()
+        with torch.no_grad():
+            generated_images_tensor = torch.tensor(np.array(self.generated_images)).to(self.device).float()
+            return self.image_encoder(generated_images_tensor).cpu().numpy()
+
     def setup_gui(self):
         """Setup main GUI components"""
         # Create main frames
@@ -2590,7 +2415,30 @@ class BrainDecoderGUI:
         self.analysis_fig = plt.Figure(figsize=(8, 4))
         self.analysis_canvas = FigureCanvasTkAgg(self.analysis_fig, self.analysis_frame)
         self.analysis_canvas.get_tk_widget().pack(fill=tk.BOTH, expand=True)
-    
+        
+    def filter_images(self):
+        """Filter images based on selected sleep stage"""
+        if not hasattr(self, 'all_generated_images'):
+            self.all_generated_images = list(zip(self.generated_images, self.target_images, self.sleep_stages))
+        
+        selected_stage = self.stage_var.get()
+        if selected_stage == "all":
+            filtered_images = self.all_generated_images
+        else:
+            filtered_images = [img_data for img_data in self.all_generated_images 
+                            if img_data[2] == selected_stage]
+        
+        # Update counts
+        total_count = len(filtered_images)
+        self.count_label.config(text=f"Showing {total_count} images")
+        
+        # Reset pagination
+        self.page_var.set(1)
+        
+        # Display filtered images
+        self.display_filtered_grid([img for img, _, _ in filtered_images])
+
+        
     def setup_help(self):
         """Setup help window content"""
         self.help_text = """
@@ -2627,7 +2475,7 @@ class BrainDecoderGUI:
         - Quality depends on EEG signal quality and selected channels
         - Ensure that EEG data extraction is completed before processing EEG
         """
-    
+
     def show_help(self):
         """Display help window"""
         help_window = tk.Toplevel(self.root)
@@ -2659,8 +2507,141 @@ class BrainDecoderGUI:
         """Update status message"""
         self.status_var.set(message)
         self.root.update_idletasks()
-        logger.info(message)
     
+    def plot_eeg(self, eeg_data):
+        """Plot EEG signal in the EEG tab"""
+        self.eeg_fig.clear()
+        ax = self.eeg_fig.add_subplot(111)
+        ax.plot(eeg_data.T)
+        channels = self.config.config['processing']['eeg_channels']
+        if channels == 'all':
+            channel_info = "All Channels"
+        else:
+            channel_info = f"Channels: {', '.join(map(str, channels))}"
+        ax.set_title(f'EEG Signal ({channel_info})')
+        ax.set_xlabel('Time')
+        ax.set_ylabel('Amplitude')
+        self.eeg_canvas.draw()
+
+    def change_page(self, action):
+        """Handle page navigation"""
+        if not hasattr(self, 'all_generated_images'):
+            return
+                
+        # Get current filtered images based on sleep stage selection
+        selected_stage = self.stage_var.get()
+        if selected_stage == "all":
+            filtered_images = self.all_generated_images
+        else:
+            filtered_images = [img_data for img_data in self.all_generated_images 
+                            if img_data[2] == selected_stage]
+        
+        # Calculate total pages
+        total_pages = (len(filtered_images) + self.images_per_page - 1) // self.images_per_page
+        current_page = self.page_var.get()
+        
+        # Handle different navigation actions
+        if action == "next" and current_page < total_pages:
+            self.page_var.set(current_page + 1)
+        elif action == "prev" and current_page > 1:
+            self.page_var.set(current_page - 1)
+        elif action == "first":
+            self.page_var.set(1)
+        elif action == "last":
+            self.page_var.set(total_pages)
+        
+        # Update display
+        self.display_filtered_grid([img for img, _, _ in filtered_images])
+        
+        # Update page indicator
+        self.page_label.config(text=f"Page {self.page_var.get()} of {total_pages}")
+        self.counter_label.config(text=f"Total Images: {len(filtered_images)}")
+    
+    def display_filtered_grid(self, filtered_images, rows=4, cols=4):
+        """Display grid of filtered images with pagination"""
+        # Debug logging
+        logger.info(f"Total images: {len(filtered_images)}")  # Changed from images to filtered_images
+
+        # Clear existing grid
+        for widget in self.scrollable_frame.winfo_children():
+            widget.destroy()
+
+        if not filtered_images:  # Changed from images to filtered_images
+            logger.warning("No images to display")
+            label = ttk.Label(self.scrollable_frame, text="No images generated yet")
+            label.pack(pady=20)
+            return
+
+        # Calculate pagination
+        self.images_per_page = rows * cols
+        current_page = self.page_var.get()
+        total_pages = (len(filtered_images) + self.images_per_page - 1) // self.images_per_page
+        
+        # Update page display
+        self.page_label.config(text=f"Page {current_page} of {total_pages}")
+        self.counter_label.config(text=f"Total Images: {len(filtered_images)}")
+        
+        # Calculate start and end indices for current page
+        start_idx = (current_page - 1) * self.images_per_page
+        end_idx = min(start_idx + self.images_per_page, len(filtered_images))
+        
+        # Create grid for current page
+        for i, img in enumerate(filtered_images[start_idx:end_idx]):  # Changed from images to filtered_images
+            frame = ttk.Frame(self.scrollable_frame)
+            frame.grid(row=i//cols, column=i%cols, padx=5, pady=5)
+
+            try:
+                # Image index label
+                idx_label = ttk.Label(frame, text=f"Image {start_idx + i + 1}")
+                idx_label.pack()
+
+                # Convert to PhotoImage
+                if img.shape[0] == 3:  # Channel first format (3, H, W)
+                    img_np = (img.transpose(1, 2, 0) * 255).clip(0, 255).astype(np.uint8)
+                    img_pil = Image.fromarray(img_np)
+                elif img.shape[0] == 1:  # Single channel
+                    img_np = (img.squeeze(0) * 255).clip(0, 255).astype(np.uint8)
+                    img_pil = Image.fromarray(img_np, mode='L')
+                else:
+                    logger.warning(f"Unexpected image shape: {img.shape}")
+                    continue
+
+                img_pil = img_pil.resize((100, 100))
+                img_tk = ImageTk.PhotoImage(img_pil)
+
+                # Display image
+                label = ttk.Label(frame, image=img_tk)
+                label.image = img_tk  # Keep reference
+                label.pack()
+
+            except Exception as e:
+                logger.error(f"Error displaying image {start_idx + i}: {str(e)}")
+                error_label = ttk.Label(frame, text=f"Error: {str(e)}")
+                error_label.pack()
+
+        # Force update
+        self.scrollable_frame.update_idletasks()
+
+    
+    def plot_psd(self, latent_vectors, title, save_path):
+        """Plot Power Spectral Density of latent vectors"""
+        latent = latent_vectors.cpu().numpy()
+        psd = []
+        for i in range(latent.shape[1]):
+            freq, power = welch(latent[:, i], fs=256, nperseg=min(256, latent.shape[1]))
+            psd.append(power)
+        psd = np.array(psd)
+        mean_psd = np.mean(psd[:, 1:], axis=0)
+        plt.figure(figsize=(10, 6))
+        plt.loglog(freq[1:], mean_psd[1:], label='Latent PSD')
+        plt.loglog(freq[1:], 1 / (freq[1:] ** self.config.config['pink_noise']['alpha']), label='1/f^alpha', linestyle='--')
+        plt.xlabel('Frequency')
+        plt.ylabel('Power Spectral Density')
+        plt.title(title)
+        plt.legend()
+        plt.savefig(save_path)
+        plt.close()
+
     def generate_images_from_eeg(self):
         """Generate images using pretrained models without training"""
         try:
@@ -2677,25 +2658,13 @@ class BrainDecoderGUI:
             # Generate images
             self.model.eval()  # Ensure model is in eval mode
             with torch.no_grad():  # No gradients needed for inference
-                for eeg_batch, image_batch, stages in tqdm(dataloader, desc="Generating Images"):
+                for eeg_batch, image_batch, _ in tqdm(dataloader, desc="Generating Images"):
                     if len(eeg_batch.shape) == 3:
                         eeg_batch = eeg_batch.unsqueeze(1)
                     generated_images, _, _ = self.model(eeg_batch.to(self.device), image_batch.to(self.device))
                     generated_images = generated_images.cpu().numpy()
                     self.generated_images.extend(generated_images)
                     self.target_images.extend(image_batch.numpy())
-                    self.sleep_stages.extend(stages)  # Populate sleep_stages
-            
-            # Store all data together for filtering
-            self.all_generated_images = list(zip(self.generated_images, 
-                                                self.target_images, 
-                                                self.sleep_stages))
-            
-            # Log stage distribution
-            stage_counts = {}
-            for stage in self.sleep_stages:
-                stage_counts[stage] = stage_counts.get(stage, 0) + 1
-            logger.info(f"Generated images by sleep stage: {stage_counts}")
             
             # Display results
             self.display_image_grid(self.generated_images)
@@ -2762,146 +2731,129 @@ class BrainDecoderGUI:
         except Exception as e:
             logger.error(f"Analysis error: {str(e)}", exc_info=True)
             self.update_status(f"Analysis partially completed with errors: {str(e)}")
-    
-    def change_page(self, action):
-        """Handle page navigation"""
-        if not hasattr(self, 'all_generated_images'):
-            return
-                
-        # Get current filtered images based on sleep stage selection
-        selected_stage = self.stage_var.get()
-        if selected_stage == "all":
-            filtered_images = self.all_generated_images
-        else:
-            filtered_images = [img_data for img_data in self.all_generated_images 
-                            if img_data[2] == selected_stage]
-        
-        # Calculate total pages
-        total_pages = (len(filtered_images) + self.images_per_page - 1) // self.images_per_page
-        current_page = self.page_var.get()
-        
-        # Handle different navigation actions
-        if action == "next" and current_page < total_pages:
-            self.page_var.set(current_page + 1)
-        elif action == "prev" and current_page > 1:
-            self.page_var.set(current_page - 1)
-        elif action == "first":
-            self.page_var.set(1)
-        elif action == "last":
-            self.page_var.set(total_pages)
-        
-        # Update display
-        self.display_filtered_grid([img for img, _, _ in filtered_images])
-        
-        # Update page indicator
-        self.page_label.config(text=f"Page {self.page_var.get()} of {total_pages}")
-        self.counter_label.config(text=f"Total Images: {len(filtered_images)}")
-    
-    def display_filtered_grid(self, filtered_images, rows=4, cols=4):
-        """Display grid of filtered images with pagination"""
-        # Debug logging
-        logger.info(f"Total images: {len(filtered_images)}")  # Changed from images to filtered_images
 
-        # Clear existing grid
-        for widget in self.scrollable_frame.winfo_children():
-            widget.destroy()
-
-        if not filtered_images:  # Changed from images to filtered_images
-            logger.warning("No images to display")
-            label = ttk.Label(self.scrollable_frame, text="No images generated yet")
-            label.pack(pady=20)
-            return
-
-        # Calculate pagination
-        self.images_per_page = rows * cols
-        current_page = self.page_var.get()
-        total_pages = (len(filtered_images) + self.images_per_page - 1) // self.images_per_page
-
-        # Update page display
-        self.page_label.config(text=f"Page {current_page} of {total_pages}")
-        self.counter_label.config(text=f"Total Images: {len(filtered_images)}")
-
-        # Calculate start and end indices for current page
-        start_idx = (current_page - 1) * self.images_per_page
-        end_idx = min(start_idx + self.images_per_page, len(filtered_images))
-
-        # Create grid for current page
-        for i, img in enumerate(filtered_images[start_idx:end_idx]):  # Changed from images to filtered_images
-            frame = ttk.Frame(self.scrollable_frame)
-            frame.grid(row=i//cols, column=i%cols, padx=5, pady=5)
-
-            try:
-                # Image index label
-                idx_label = ttk.Label(frame, text=f"Image {start_idx + i + 1}")
-                idx_label.pack()
-
-                # Convert to PhotoImage
-                if img.shape[0] == 3:  # Channel first format (3, H, W)
-                    img_np = (img.transpose(1, 2, 0) * 255).clip(0, 255).astype(np.uint8)
-                    img_pil = Image.fromarray(img_np)
-                elif img.shape[0] == 1:  # Single channel
-                    img_np = (img.squeeze(0) * 255).clip(0, 255).astype(np.uint8)
-                    img_pil = Image.fromarray(img_np, mode='L')
-                else:
-                    logger.warning(f"Unexpected image shape: {img.shape}")
-                    continue
-
-                img_pil = img_pil.resize((100, 100))
-                img_tk = ImageTk.PhotoImage(img_pil)
-
-                # Display image
-                label = ttk.Label(frame, image=img_tk)
-                label.image = img_tk  # Keep reference
-                label.pack()
-
-            except Exception as e:
-                logger.error(f"Error displaying image {start_idx + i}: {str(e)}")
-                error_label = ttk.Label(frame, text=f"Error: {str(e)}")
-                error_label.pack()
-
-        # Force update
-        self.scrollable_frame.update_idletasks()
-    
-    def run_training(self, trainer, train_loader, val_loader):
-        """Run the training loop"""
+    def generate_video(self):
         try:
-            self.update_status("Starting training of BrainDecoderModel...")
-            trainer.train(train_loader, val_loader)
-            self.update_status("Training completed. Generating images...")
+            self.update_status("Generating video...")
             
-            # Generate images for test set
-            test_eeg, test_images, _ = next(iter(train_loader))
+            # If we don't have generated images yet, but we have trained models, generate them
+            if len(self.generated_images) == 0:
+                # Check if we have trained models
+                brain_decoder_path = self.paths.get_model_path('brain_decoder_best')
+                image_encoder_path = self.paths.get_model_path('image_encoder_best')
+                modality_alignment_path = self.paths.get_model_path('modality_alignment_best')
+                if brain_decoder_path.exists() and image_encoder_path.exists() and modality_alignment_path.exists():
+                    # Load saved models
+                    self.model.load_state_dict(torch.load(brain_decoder_path, map_location=self.device))
+                    self.image_encoder.load_state_dict(torch.load(image_encoder_path, map_location=self.device))
+                    self.model.modality_alignment.load_state_dict(torch.load(modality_alignment_path, map_location=self.device))
+                    self.model.eval()
+                    self.image_encoder.eval()
+                    
+                    # Get test data and generate images
+                    processed_dir = self.paths.data_dir / 'processed'
+                    dataset = BrainDataset(processed_dir, transform=transforms.ToTensor())
+                    test_loader = DataLoader(dataset, batch_size=16, shuffle=False, num_workers=4)
+                    
+                    with torch.no_grad():
+                        for eeg_batch, image_batch, _ in test_loader:
+                            if len(eeg_batch.shape) == 3:
+                                eeg_batch = eeg_batch.unsqueeze(1)
+                            generated_images, _, _ = self.model(eeg_batch.to(self.device), image_batch.to(self.device))
+                            self.generated_images = list(generated_images.cpu().numpy())  # Ensure it's a list
+                            self.target_images = list(image_batch.numpy())
+                            # Display the generated images
+                            self.display_image_grid(self.generated_images)
+                            self.notebook.select(1)  # Switch to Generated Images tab
+                            break  # Just get one batch for the video
+                        else:
+                            self.update_status("No trained models found. Please process EEG data first.")
+                            return
+                else:
+                    self.update_status("No trained models found. Please process EEG data first.")
+                    return
             
-            # Ensure proper dimensions for EEG data
-            if len(test_eeg.shape) == 3:  # If shape is (batch, channels, time)
-                test_eeg = test_eeg.unsqueeze(1)  # Add extra dimension if needed
-            
-            with torch.no_grad():
-                generated_images, _, _ = self.model(test_eeg.to(self.device), test_images.to(self.device))
-                generated_images = generated_images.cpu().numpy()
-                logger.info(f"Generated {len(generated_images)} images with shape {generated_images.shape}")
+            if len(self.generated_images) == 0:
+                self.update_status("No images available for video")
+                return
                 
-                self.generated_images = list(generated_images)  # Ensure it's a list
-                self.target_images = list(test_images.numpy())
-                
-                logger.info(f"Stored {len(self.generated_images)} images")
+            # Create video
+            output_path = self.paths.results_dir / 'brain_decoding.mp4'
             
-            # Display generated images and switch to images tab
-            def update_display():
-                self.display_image_grid(self.generated_images)
-                self.notebook.select(1)  # Select Generated Images tab
-                logger.info("Updated display and switched to images tab")
-                
-            self.root.after(100, update_display)  # Small delay to ensure GUI is ready
+            # Convert images from (3,32,32) to (32,32,3)
+            images_rgb = [img.transpose(1,2,0) for img in self.generated_images]
             
-            # Perform analysis
-            self.perform_analysis()
+            # Write video using imageio
+            imageio.mimsave(str(output_path), images_rgb, fps=self.config.config['visualization']['fps'])
             
-            self.update_status("Processing completed successfully.")
+            self.update_status(f"Video saved to {output_path}")
+            
         except Exception as e:
-            messagebox.showerror("Error", f"An error occurred during training: {str(e)}")
-            logger.error(f"Training error: {str(e)}", exc_info=True)
+            self.update_status(f"Error generating video: {str(e)}")
+            logger.error(f"Video generation error: {str(e)}", exc_info=True)
     
+    def extract_eeg_data(self):
+        """Extract and organize EEG data segments"""
+        edf_file = self.file_entry.get()
+        channels = self.channels_var.get()
+        
+        if not edf_file:
+            messagebox.showerror("Error", "Please select an EDF file.")
+            return
+            
+        try:
+            self.update_status("Extracting EEG data...")
+            extractor = EEGExtractor(edf_file, selected_channels=channels)
+            extractor.load_edf()
+            
+            save_dir = self.paths.data_dir / 'processed'
+            extractor.extract_segments(save_dir)
+            
+            # Create latent pairs if VAE is available
+            vae_path = self.paths.get_model_path('vae_best')
+            if vae_path.exists():
+                vae = VAE(self.config).to(self.device)
+                vae.load_state_dict(torch.load(vae_path, map_location=self.device))
+                vae.eval()
+                extractor.create_latent_pairs(save_dir, vae)
+            else:
+                logger.warning(f"VAE model not found at '{vae_path}'. Latent pairs will not be created.")
+            
+            self.update_status("EEG data extracted and organized successfully")
+            
+            # Update visualization
+            self.plot_stage_distribution(save_dir)
+            
+        except Exception as e:
+            messagebox.showerror("Error", f"Failed to extract EEG data: {str(e)}")
+            logger.error(f"EEG extraction error: {str(e)}", exc_info=True)
+    
+        # Plot EEG data
+        try:
+            data = extractor.raw.get_data()
+            self.plot_eeg(data)
+        except Exception as e:
+            logger.error(f"Error plotting EEG data: {str(e)}", exc_info=True)
+    
+    def plot_stage_distribution(self, processed_dir):
+        """Plot distribution of sleep stages"""
+        with open(processed_dir / 'eeg_metadata.json', 'r') as f:
+            metadata = json.load(f)
+            
+        stages = metadata['stages']
+        fig = Figure(figsize=(6, 4))
+        ax = fig.add_subplot(111)
+        ax.bar(stages.keys(), stages.values())
+        ax.set_title('Sleep Stage Distribution')
+        ax.set_ylabel('Number of Segments')
+        
+        # Update analysis tab
+        for widget in self.analysis_frame.winfo_children():
+            widget.destroy()
+        canvas = FigureCanvasTkAgg(fig, self.analysis_frame)
+        canvas.draw()
+        canvas.get_tk_widget().pack(fill=tk.BOTH, expand=True)
+        
     def process_eeg(self):
         """Process the extracted EEG segments"""
         processed_dir = self.paths.data_dir / 'processed'
@@ -3002,7 +2954,7 @@ class BrainDecoderGUI:
                     logger.info(f"Generated images by sleep stage: {stage_counts}")
                     
                     # Display initial results (all stages)
-                    self.display_image_grid([img for img, _, _ in self.all_generated_images])
+                    self.filter_images()  # This will trigger the display with "all" stages
                     self.notebook.select(1)  # Switch to Generated Images tab
                     
                     # Perform analysis
@@ -3029,12 +2981,12 @@ class BrainDecoderGUI:
             ).to(self.device)
             
             # Initialize Trainer
-            trainer = TrainerVAE(
+            trainer = Trainer(
                 model=self.model,
                 device=self.device,
                 project_paths=self.paths,
-                train_loader=train_loader,
-                val_loader=val_loader,
+                image_encoder=self.image_encoder,
+                contrastive_loss=contrastive_loss,
                 config=self.config
             )
             
@@ -3044,7 +2996,7 @@ class BrainDecoderGUI:
                 args=(trainer, train_loader, val_loader),
                 daemon=True
             ).start()
-
+            
         except Exception as e:
             messagebox.showerror("Error", f"Failed to process EEG data: {str(e)}")
             logger.error(f"EEG processing error: {str(e)}", exc_info=True)
@@ -3053,7 +3005,7 @@ class BrainDecoderGUI:
         """Run the training loop"""
         try:
             self.update_status("Starting training of BrainDecoderModel...")
-            trainer.train()
+            trainer.train(train_loader, val_loader)
             self.update_status("Training completed. Generating images...")
             
             # Generate images for test set
@@ -3078,7 +3030,7 @@ class BrainDecoderGUI:
                 self.display_image_grid(self.generated_images)
                 self.notebook.select(1)  # Select Generated Images tab
                 logger.info("Updated display and switched to images tab")
-            
+                
             self.root.after(100, update_display)  # Small delay to ensure GUI is ready
             
             # Perform analysis
@@ -3089,71 +3041,6 @@ class BrainDecoderGUI:
             messagebox.showerror("Error", f"An error occurred during training: {str(e)}")
             logger.error(f"Training error: {str(e)}", exc_info=True)
     
-    def generate_video(self):
-        try:
-            self.update_status("Generating video...")
-            
-            # If we don't have generated images yet, but we have trained models, generate them
-            if len(self.generated_images) == 0:
-                # Check if we have trained models
-                brain_decoder_path = self.paths.get_model_path('brain_decoder_best')
-                image_encoder_path = self.paths.get_model_path('image_encoder_best')
-                modality_alignment_path = self.paths.get_model_path('modality_alignment_best')
-                if brain_decoder_path.exists() and image_encoder_path.exists() and modality_alignment_path.exists():
-                    # Load saved models
-                    self.model.load_state_dict(torch.load(brain_decoder_path, map_location=self.device))
-                    self.image_encoder.load_state_dict(torch.load(image_encoder_path, map_location=self.device))
-                    self.model.modality_alignment.load_state_dict(torch.load(modality_alignment_path, map_location=self.device))
-                    self.model.eval()
-                    self.image_encoder.eval()
-                    
-                    # Get test data and generate images
-                    processed_dir = self.paths.data_dir / 'processed'
-                    dataset = BrainDataset(processed_dir, transform=transforms.ToTensor())
-                    test_loader = DataLoader(dataset, batch_size=16, shuffle=False, num_workers=4)
-                    
-                    with torch.no_grad():
-                        for eeg_batch, image_batch, stages in test_loader:
-                            if len(eeg_batch.shape) == 3:
-                                eeg_batch = eeg_batch.unsqueeze(1)
-                            generated_images, _, _ = self.model(eeg_batch.to(self.device), image_batch.to(self.device))
-                            self.generated_images = list(generated_images.cpu().numpy())  # Ensure it's a list
-                            self.target_images = list(image_batch.numpy())
-                            self.sleep_stages = list(stages)  # Populate sleep_stages
-                            # Store all data together for filtering
-                            self.all_generated_images = list(zip(self.generated_images, 
-                                                            self.target_images, 
-                                                            self.sleep_stages))
-                            # Display the generated images
-                            self.display_image_grid(self.generated_images)
-                            self.notebook.select(1)  # Switch to Generated Images tab
-                            break  # Just get one batch for the video
-                        else:
-                            self.update_status("No trained models found. Please process EEG data first.")
-                            return
-                else:
-                    self.update_status("No trained models found. Please process EEG data first.")
-                    return
-            
-            if len(self.generated_images) == 0:
-                self.update_status("No images available for video")
-                return
-                
-            # Create video
-            output_path = self.paths.results_dir / 'brain_decoding.mp4'
-            
-            # Convert images from (3,32,32) to (32,32,3)
-            images_rgb = [img.transpose(1,2,0) for img in self.generated_images]
-            
-            # Write video using imageio
-            imageio.mimsave(str(output_path), images_rgb, fps=self.config.config['visualization']['fps'])
-            
-            self.update_status(f"Video saved to {output_path}")
-            
-        except Exception as e:
-            self.update_status(f"Error generating video: {str(e)}")
-            logger.error(f"Video generation error: {str(e)}", exc_info=True)
-    
     def run(self):
         """Start the GUI"""
         self.root.mainloop()
@@ -3163,6 +3050,67 @@ class BrainDecoderGUI:
 # =======================
 
 # (Test cases are defined above in the Test Classes section)
+
+# =======================
+# Function Definitions
+# =======================
+
+def train_and_extract_latents(config: Config, project_paths: ProjectPaths):
+    """Train VAE and extract latent vectors"""
+    logger.info("Starting VAE training and latent extraction...")
+    # Adjusted transforms to remove normalization
+    transform = transforms.Compose(config.config['model']['augmentation_transforms'] + [
+        transforms.ToTensor(),
+        # Removed normalization to keep [0,1] range
+    ]) if config.config['model']['use_augmentation'] else transforms.Compose([
+        transforms.ToTensor(),
+        # Removed normalization to keep [0,1] range
+    ])
+    
+    trainset = datasets.CIFAR10(root=str(project_paths.data_dir), train=True,
+                                 download=True, transform=transform)
+    val_size = int(config.config['training']['val_split'] * len(trainset))
+    train_size = len(trainset) - val_size
+    train_dataset, val_dataset = random_split(trainset, [train_size, val_size])
+    
+    train_loader = DataLoader(train_dataset, batch_size=config.config['model']['batch_size'], shuffle=True, num_workers=4)
+    val_loader = DataLoader(val_dataset, batch_size=config.config['model']['batch_size'], shuffle=False, num_workers=4)
+    
+    # Initialize VAE
+    vae = VAE(config).to(config.device)
+    
+    # Initialize TrainerVAE
+    vae_trainer = TrainerVAE(model=vae, device=config.device, project_paths=project_paths, 
+                             train_loader=train_loader, val_loader=val_loader, config=config)
+    vae_trainer.train()
+    
+    # Extract latent vectors from test set
+    logger.info("Extracting latent vectors from test set...")
+    testset = datasets.CIFAR10(root=str(project_paths.data_dir), train=False,
+                                download=True, transform=transform)
+    test_loader = DataLoader(testset, batch_size=config.config['model']['batch_size'], shuffle=False, num_workers=4)
+    
+    vae.eval()
+    all_latents = []
+    all_labels = []
+    
+    with torch.no_grad():
+        for images, labels_batch in tqdm(test_loader, desc="Extracting Latents"):
+            images = images.to(config.device)
+            recon_images, mu, logvar = vae(images)
+            latents = mu.cpu().numpy()
+            all_latents.append(latents)
+            all_labels.append(labels_batch.numpy())
+    
+    latents = np.concatenate(all_latents, axis=0)
+    labels = np.concatenate(all_labels, axis=0)
+    
+    # Save latent vectors and labels
+    np.save(project_paths.get_latent_path('cifar10_latents'), latents)
+    np.save(project_paths.get_latent_path('cifar10_labels'), labels)
+    logger.info(f"Latent vectors and labels saved to '{project_paths.latents_dir}'")
+    
+    return latents, labels
 
 # =======================
 # Main Execution
@@ -3208,8 +3156,8 @@ if __name__ == "__main__":
         vae.load_state_dict(torch.load(vae_path, map_location=device))
         vae.eval()
     else:
-        # Train VAE and extract latents, and capture the trained 'vae'
-        latents, labels, vae = train_and_extract_latents(config, project_paths)
+        # Train VAE and extract latents
+        latents, labels = train_and_extract_latents(config, project_paths)
     
     # Initialize scalers
     scaler_eeg = StandardScaler()

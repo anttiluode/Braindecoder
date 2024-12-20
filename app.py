@@ -1614,17 +1614,56 @@ class ResultAnalyzer:
         }
     
     def _analyze_alignment(self, eeg_latents, image_latents):
-        """Analyze alignment between EEG and image latent spaces"""
-        # Compute correlation matrix
-        correlation = np.corrcoef(eeg_latents.T, image_latents.T)
-        n = len(eeg_latents.T)
-        correlation = correlation[:n, n:]
-        
-        return {
-            'mean_correlation': np.mean(correlation),
-            'max_correlation': np.max(correlation),
-            'correlation_matrix': correlation
-        }
+        """Analyze alignment between EEG and image latent spaces with size handling"""
+        try:
+            # Log shapes for debugging
+            logger.info(f"EEG latents shape: {eeg_latents.shape}")
+            logger.info(f"Image latents shape: {image_latents.shape}")
+            
+            # Ensure we're using the same number of samples
+            min_samples = min(eeg_latents.shape[0], image_latents.shape[0])
+            eeg_latents = eeg_latents[:min_samples]
+            image_latents = image_latents[:min_samples]
+            
+            # Ensure we're comparing the same dimensionality
+            if eeg_latents.shape[1] != image_latents.shape[1]:
+                logger.warning("Latent dimensions don't match - using dimensionality reduction")
+                # Use smaller dimension as target
+                target_dim = min(eeg_latents.shape[1], image_latents.shape[1])
+                
+                # Simple dimensionality reduction via PCA
+                from sklearn.decomposition import PCA
+                
+                if eeg_latents.shape[1] > target_dim:
+                    pca = PCA(n_components=target_dim)
+                    eeg_latents = pca.fit_transform(eeg_latents)
+                    
+                if image_latents.shape[1] > target_dim:
+                    pca = PCA(n_components=target_dim)
+                    image_latents = pca.fit_transform(image_latents)
+            
+            # Compute correlation matrix
+            correlation = np.corrcoef(eeg_latents.T, image_latents.T)
+            n = len(eeg_latents.T)
+            correlation = correlation[:n, n:]
+            
+            return {
+                'mean_correlation': np.mean(correlation),
+                'max_correlation': np.max(correlation),
+                'correlation_matrix': correlation,
+                'eeg_dim': eeg_latents.shape[1],
+                'image_dim': image_latents.shape[1],
+                'n_samples': min_samples
+            }
+            
+        except Exception as e:
+            logger.error(f"Error in alignment analysis: {str(e)}")
+            return {
+                'mean_correlation': None,
+                'max_correlation': None,
+                'correlation_matrix': None,
+                'error': str(e)
+            }
     
     def visualize_results(self, analysis, save_dir=None):
         """Create visualization of analysis results"""
@@ -1697,6 +1736,21 @@ class ResultAnalyzer:
 # Results Manager
 # =======================
 
+def numpy_to_python(obj):
+    """Convert numpy types to Python native types"""
+    if isinstance(obj, np.integer):
+        return int(obj)
+    elif isinstance(obj, np.floating):
+        return float(obj)
+    elif isinstance(obj, np.ndarray):
+        return obj.tolist()
+    elif isinstance(obj, dict):
+        return {k: numpy_to_python(v) for k, v in obj.items()}
+    elif isinstance(obj, list):
+        return [numpy_to_python(item) for item in obj]
+    else:
+        return obj
+
 class ResultsManager:
     """Manages saving and loading of results"""
     def __init__(self, project_paths):
@@ -1704,18 +1758,25 @@ class ResultsManager:
         self.results_dir = project_paths.results_dir
         
     def save_session(self, session_data):
-        """Save a complete processing session"""
+        """Save a complete processing session with proper type conversion"""
         timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
         session_dir = self.results_dir / f'session_{timestamp}'
         session_dir.mkdir(parents=True, exist_ok=True)
         
+        # Convert numpy types to Python native types for JSON serialization
+        serializable_data = {
+            'config': session_data['config'],
+            'metrics': numpy_to_python(session_data['metrics']),
+            'analysis': numpy_to_python(session_data['analysis'])
+        }
+        
         # Save configuration
         with open(session_dir / 'config.yaml', 'w') as f:
-            yaml.dump(session_data['config'], f)
+            yaml.dump(serializable_data['config'], f)
             
         # Save metrics
         with open(session_dir / 'metrics.json', 'w') as f:
-            json.dump(session_data['metrics'], f, indent=2)
+            json.dump(serializable_data['metrics'], f, indent=2)
             
         # Save generated images
         if 'images' in session_data:
@@ -1725,7 +1786,7 @@ class ResultsManager:
         # Save analysis results
         if 'analysis' in session_data:
             with open(session_dir / 'analysis.json', 'w') as f:
-                json.dump(session_data['analysis'], f, indent=2)
+                json.dump(serializable_data['analysis'], f, indent=2)
                 
         logger.info(f"Session saved to '{session_dir}'")
         return session_dir
@@ -1758,6 +1819,7 @@ class ResultsManager:
         logger.info(f"Session loaded from '{session_dir}'")
         return session_data
     
+
     def list_sessions(self):
         """List all saved sessions"""
         sessions = []
@@ -2099,6 +2161,73 @@ class BrainDecoderGUI:
             logger.info(f"Loaded existing latents from '{latents_path}'")
         
         return latents
+
+    def update_visualizations(self, analysis, session_dir):
+        """Update visualizations in the analysis tab based on analysis results"""
+        try:
+            # Clear existing visualizations
+            for widget in self.analysis_frame.winfo_children():
+                widget.destroy()
+                
+            # Create figure with multiple subplots
+            fig = Figure(figsize=(12, 8))
+            
+            # Latent space visualization (if available)
+            if analysis.get('clustering') and analysis['clustering'].get('k_star_distribution'):
+                ax1 = fig.add_subplot(221)
+                k_star = analysis['clustering']['k_star_distribution']
+                ax1.hist(k_star['values'], bins=50)
+                ax1.axvline(k_star['mean'], color='r', linestyle='--',
+                        label=f"Mean: {k_star['mean']:.3f}")
+                ax1.set_title("k* Distribution")
+                ax1.set_xlabel('k*')
+                ax1.set_ylabel('Count')
+                ax1.legend()
+            
+            # Correlation matrix (if available)
+            if analysis.get('alignment') and analysis['alignment'].get('correlation_matrix') is not None:
+                ax2 = fig.add_subplot(222)
+                correlation = np.array(analysis['alignment']['correlation_matrix'])
+                im = ax2.imshow(correlation, cmap='coolwarm', aspect='auto')
+                ax2.set_title('EEG-Image Latent Space Correlation')
+                plt.colorbar(im, ax=ax2)
+            
+            # Distribution statistics (if available)
+            if analysis.get('distribution'):
+                ax3 = fig.add_subplot(223)
+                dist = analysis['distribution']
+                if isinstance(dist.get('mean'), list):
+                    ax3.plot(dist['mean'], label='Mean')
+                    ax3.plot(dist['std'], label='Std')
+                    ax3.set_title('Latent Distribution Statistics')
+                    ax3.legend()
+            
+            # Sleep stage distribution (if available)
+            if hasattr(self, 'sleep_stages') and self.sleep_stages:
+                ax4 = fig.add_subplot(224)
+                stage_counts = {}
+                for stage in self.sleep_stages:
+                    stage_counts[stage] = stage_counts.get(stage, 0) + 1
+                ax4.bar(stage_counts.keys(), stage_counts.values())
+                ax4.set_title('Sleep Stage Distribution')
+                plt.setp(ax4.xaxis.get_majorticklabels(), rotation=45)
+            
+            # Adjust layout and display
+            fig.tight_layout()
+            
+            # Create canvas and display
+            canvas = FigureCanvasTkAgg(fig, self.analysis_frame)
+            canvas.draw()
+            canvas.get_tk_widget().pack(fill=tk.BOTH, expand=True)
+            
+            # Switch to analysis tab
+            self.notebook.select(2)  # Index 2 should be the analysis tab
+            
+            self.update_status("Analysis visualizations updated")
+            
+        except Exception as e:
+            logger.error(f"Error updating visualizations: {str(e)}", exc_info=True)
+            self.update_status("Error updating visualizations")
 
     def _encode_generated_images(self):
         """Encode generated images to get their latent representations"""

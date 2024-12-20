@@ -1,7 +1,5 @@
 # Braindecoder
 
-(Current version errors at get or generate latents. Trying to fix it..)
-
 Video demo:
 
 [![Video Thumbnail](https://img.youtube.com/vi/UqvO8JjcLMM/maxresdefault.jpg)](https://www.youtube.com/watch?v=UqvO8JjcLMM)

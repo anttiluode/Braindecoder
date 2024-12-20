@@ -2190,7 +2190,13 @@ class BrainDecoderGUI:
                 correlation = np.array(analysis['alignment']['correlation_matrix'])
                 im = ax2.imshow(correlation, cmap='coolwarm', aspect='auto')
                 ax2.set_title('EEG-Image Latent Space Correlation')
-                plt.colorbar(im, ax=ax2)
+                fig.colorbar(im, ax=ax2)  # Use fig.colorbar instead of plt.colorbar
+                
+                # Add correlation stats if available
+                if analysis['alignment'].get('mean_correlation') is not None:
+                    ax2.set_xlabel(f'Mean Corr: {analysis["alignment"]["mean_correlation"]:.3f}')
+                if analysis['alignment'].get('max_correlation') is not None:
+                    ax2.set_ylabel(f'Max Corr: {analysis["alignment"]["max_correlation"]:.3f}')
             
             # Distribution statistics (if available)
             if analysis.get('distribution'):
@@ -2208,9 +2214,22 @@ class BrainDecoderGUI:
                 stage_counts = {}
                 for stage in self.sleep_stages:
                     stage_counts[stage] = stage_counts.get(stage, 0) + 1
-                ax4.bar(stage_counts.keys(), stage_counts.values())
+                
+                # Create bar plot
+                bars = ax4.bar(stage_counts.keys(), stage_counts.values())
                 ax4.set_title('Sleep Stage Distribution')
-                plt.setp(ax4.xaxis.get_majorticklabels(), rotation=45)
+                
+                # Add value labels on top of bars
+                for bar in bars:
+                    height = bar.get_height()
+                    ax4.annotate(f'{int(height)}',
+                                xy=(bar.get_x() + bar.get_width()/2, height),
+                                xytext=(0, 3),  # 3 points vertical offset
+                                textcoords="offset points",
+                                ha='center', va='bottom')
+                
+                # Rotate labels for better readability
+                ax4.tick_params(axis='x', rotation=45)
             
             # Adjust layout and display
             fig.tight_layout()
@@ -2222,6 +2241,19 @@ class BrainDecoderGUI:
             
             # Switch to analysis tab
             self.notebook.select(2)  # Index 2 should be the analysis tab
+            
+            # Add text summary
+            if analysis.get('alignment'):
+                summary_text = f"Analysis Summary:\n"
+                if 'n_samples' in analysis['alignment']:
+                    summary_text += f"Samples analyzed: {analysis['alignment']['n_samples']}\n"
+                if 'eeg_dim' in analysis['alignment']:
+                    summary_text += f"EEG latent dimensions: {analysis['alignment']['eeg_dim']}\n"
+                if 'image_dim' in analysis['alignment']:
+                    summary_text += f"Image latent dimensions: {analysis['alignment']['image_dim']}\n"
+                    
+                summary_label = ttk.Label(self.analysis_frame, text=summary_text, justify=tk.LEFT)
+                summary_label.pack(pady=10)
             
             self.update_status("Analysis visualizations updated")
             

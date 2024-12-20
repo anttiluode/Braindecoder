@@ -1451,19 +1451,8 @@ class ResultAnalyzer:
         # Then convert to tensor
         return F.mse_loss(torch.tensor(generated_array), 
                         torch.tensor(target_array)).item()
-    
-    def _compute_ssim(self, generated, target):
-        """Compute Structural Similarity Index"""
-        from skimage.metrics import structural_similarity as compare_ssim
-        ssim_values = []
-        for gen, tgt in zip(generated, target):
-            # Convert to grayscale for SSIM
-            gen_gray = cv2.cvtColor(gen.transpose(1, 2, 0), cv2.COLOR_RGB2GRAY)
-            tgt_gray = cv2.cvtColor(tgt.transpose(1, 2, 0), cv2.COLOR_RGB2GRAY)
-            ssim, _ = compare_ssim(gen_gray, tgt_gray, full=True)
-            ssim_values.append(ssim)
-        return np.mean(ssim_values)
-    
+   
+   
     def _compute_ssim(self, generated, target):
         """Compute Structural Similarity Index"""
         from skimage.metrics import structural_similarity as compare_ssim
@@ -2114,7 +2103,7 @@ def train_and_extract_latents(config: Config, project_paths: ProjectPaths):
     np.save(project_paths.get_latent_path('cifar10_labels'), labels)
     logger.info(f"Latent vectors and labels saved to '{project_paths.latents_dir}'")
     
-    return latents, labels
+    return vae, latents, labels
 
 # =======================
 # Brain Decoder GUI
@@ -3181,73 +3170,6 @@ class BrainDecoderGUI:
         self.root.mainloop()
 
 # =======================
-# Test Cases using Pytest
-# =======================
-
-# (Test cases are defined above in the Test Classes section)
-
-# =======================
-# Function Definitions
-# =======================
-
-def train_and_extract_latents(config: Config, project_paths: ProjectPaths):
-    """Train VAE and extract latent vectors"""
-    logger.info("Starting VAE training and latent extraction...")
-    # Adjusted transforms to remove normalization
-    transform = transforms.Compose(config.config['model']['augmentation_transforms'] + [
-        transforms.ToTensor(),
-        # Removed normalization to keep [0,1] range
-    ]) if config.config['model']['use_augmentation'] else transforms.Compose([
-        transforms.ToTensor(),
-        # Removed normalization to keep [0,1] range
-    ])
-    
-    trainset = datasets.CIFAR10(root=str(project_paths.data_dir), train=True,
-                                 download=True, transform=transform)
-    val_size = int(config.config['training']['val_split'] * len(trainset))
-    train_size = len(trainset) - val_size
-    train_dataset, val_dataset = random_split(trainset, [train_size, val_size])
-    
-    train_loader = DataLoader(train_dataset, batch_size=config.config['model']['batch_size'], shuffle=True, num_workers=4)
-    val_loader = DataLoader(val_dataset, batch_size=config.config['model']['batch_size'], shuffle=False, num_workers=4)
-    
-    # Initialize VAE
-    vae = VAE(config).to(config.device)
-    
-    # Initialize TrainerVAE
-    vae_trainer = TrainerVAE(model=vae, device=config.device, project_paths=project_paths, 
-                             train_loader=train_loader, val_loader=val_loader, config=config)
-    vae_trainer.train()
-    
-    # Extract latent vectors from test set
-    logger.info("Extracting latent vectors from test set...")
-    testset = datasets.CIFAR10(root=str(project_paths.data_dir), train=False,
-                                download=True, transform=transform)
-    test_loader = DataLoader(testset, batch_size=config.config['model']['batch_size'], shuffle=False, num_workers=4)
-    
-    vae.eval()
-    all_latents = []
-    all_labels = []
-    
-    with torch.no_grad():
-        for images, labels_batch in tqdm(test_loader, desc="Extracting Latents"):
-            images = images.to(config.device)
-            recon_images, mu, logvar = vae(images)
-            latents = mu.cpu().numpy()
-            all_latents.append(latents)
-            all_labels.append(labels_batch.numpy())
-    
-    latents = np.concatenate(all_latents, axis=0)
-    labels = np.concatenate(all_labels, axis=0)
-    
-    # Save latent vectors and labels
-    np.save(project_paths.get_latent_path('cifar10_latents'), latents)
-    np.save(project_paths.get_latent_path('cifar10_labels'), labels)
-    logger.info(f"Latent vectors and labels saved to '{project_paths.latents_dir}'")
-    
-    return latents, labels
-
-# =======================
 # Main Execution
 # =======================
 
@@ -3274,7 +3196,6 @@ if __name__ == "__main__":
         logger.info("Preparing CIFAR-10 dataset...")
         transform = transforms.Compose([
             transforms.ToTensor(),
-            # Removed normalization to keep [0,1] range
         ])
         trainset = datasets.CIFAR10(root=str(project_paths.data_dir), train=True,
                                      download=True, transform=transform)
@@ -3290,26 +3211,20 @@ if __name__ == "__main__":
         vae = VAE(config).to(device)
         vae.load_state_dict(torch.load(vae_path, map_location=device))
         vae.eval()
+        # Train VAE and extract latents if needed
+        latents, labels = None, None
     else:
         # Train VAE and extract latents
-        latents, labels = train_and_extract_latents(config, project_paths)
-    
+        vae, latents, labels = train_and_extract_latents(config, project_paths)
+        # Save the newly trained VAE
+        torch.save(vae.state_dict(), vae_path)
+        logger.info(f"Saved trained VAE model to '{vae_path}'")
+
     # Initialize scalers
     scaler_eeg = StandardScaler()
     scaler_latent = StandardScaler()
-    
-    # Load VAE model
-    # Note: If VAE was loaded above, no need to train again
-    if not vae_path.exists():
-        # VAE has been trained in train_and_extract_latents
-        # Save the trained VAE
-        torch.save(vae.state_dict(), vae_path)
-        logger.info(f"Saved trained VAE model to '{vae_path}'")
-    else:
-        # VAE was loaded, no action needed
-        pass
-    
-    # Initialize Pretrained Image Decoder
+
+    # Initialize Pretrained Image Decoder with the loaded or trained VAE
     image_decoder = PretrainedImageDecoder(vae, device=device)
     
     # Initialize BrainDecoderModel

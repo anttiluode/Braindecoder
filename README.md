@@ -5,7 +5,7 @@ Video demo:
 [![Video Thumbnail](https://img.youtube.com/vi/UqvO8JjcLMM/maxresdefault.jpg)](https://www.youtube.com/watch?v=UqvO8JjcLMM)
 
 
-An experimental project exploring EEG-based latent space representations during sleep using variational autoencoders. 
+An experimental project exploring EEG-based latent space representations (EDF format files) during sleep using variational autoencoders. 
 
 # About
 

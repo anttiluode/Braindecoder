@@ -1,4 +1,4 @@
-# Dream2Image
+# Braindecoder
 An experimental project exploring EEG-based latent space representations during sleep using variational autoencoders. 
 
 # About

@@ -2065,6 +2065,48 @@ class BrainDecoderGUI:
         self.generated_images = []
         self.target_images = []
     
+    def _get_or_generate_latents(self):
+        """Get existing latents or generate new ones"""
+        # Try to load existing latents
+        latents_path = self.paths.get_latent_path('cifar10_latents')
+        
+        if not latents_path.exists():
+            logger.info("Latent vectors not found. Generating new latents...")
+            
+            # Get or load VAE
+            vae_path = self.paths.get_model_path('vae_best')
+            if not vae_path.exists():
+                # Train VAE and extract latents
+                latents, _ = train_and_extract_latents(self.config, self.paths)
+            else:
+                # Load existing VAE and generate latents
+                vae = VAE(self.config).to(self.device)
+                vae.load_state_dict(torch.load(vae_path, map_location=self.device))
+                vae.eval()
+                
+                # Generate latents from generated images
+                with torch.no_grad():
+                    images_tensor = torch.tensor(self.generated_images).to(self.device).float()
+                    mu, logvar, _ = vae.encode(images_tensor)
+                    latents = mu.cpu().numpy()
+                    
+            # Save latents
+            np.save(latents_path, latents)
+            logger.info(f"Generated and saved latent vectors to '{latents_path}'")
+        else:
+            # Load existing latents
+            latents = np.load(latents_path)
+            logger.info(f"Loaded existing latents from '{latents_path}'")
+        
+        return latents
+
+    def _encode_generated_images(self):
+        """Encode generated images to get their latent representations"""
+        self.image_encoder.eval()
+        with torch.no_grad():
+            generated_images_tensor = torch.tensor(np.array(self.generated_images)).to(self.device).float()
+            return self.image_encoder(generated_images_tensor).cpu().numpy()
+
     def setup_gui(self):
         """Setup main GUI components"""
         # Create main frames
@@ -2476,7 +2518,7 @@ class BrainDecoderGUI:
             logger.error(f"Image generation error: {str(e)}", exc_info=True)
     
     def perform_analysis(self):
-        """Perform analysis with graceful error handling"""
+        """Perform analysis after processing"""
         if not self.generated_images:
             return
 
@@ -2484,30 +2526,44 @@ class BrainDecoderGUI:
             # Use sleep_stages as labels
             labels = np.array(self.sleep_stages)
             
-            # Load or generate latents
+            # Get latents
             latents = self._get_or_generate_latents()
+            
+            # Ensure we have the right number of latents
+            if len(latents) != len(labels):
+                logger.warning(f"Number of latents ({len(latents)}) does not match number of labels ({len(labels)})")
+                # Adjust latents or labels as needed
+                min_len = min(len(latents), len(labels))
+                latents = latents[:min_len]
+                labels = labels[:min_len]
             
             # Scale latents
             scaled_latents = self.scaler_latent.fit_transform(latents)
             
-            # Get generated latents
+            # Get generated latent representations
             generated_latents = self._encode_generated_images()
             
-            # Perform analysis
+            # Analyze results
             analyzer = ResultAnalyzer(self.paths, self.device)
-            analysis = analyzer.analyze_latent_space(scaled_latents, generated_latents, labels)
+            metrics = analyzer.compute_metrics(self.generated_images, self.target_images)
             
-            # Save session even if some metrics are None
+            # Check unique labels before calling analyze_latent_space
+            if len(np.unique(labels)) > 1:
+                analysis = analyzer.analyze_latent_space(scaled_latents, generated_latents, labels)
+            else:
+                logger.warning("Only one unique label found - skipping clustering analysis")
+                analysis = analyzer.analyze_latent_space(scaled_latents, generated_latents, None)
+            
+            # Save session
             session_data = {
                 'config': self.config.config,
-                'metrics': self._compute_available_metrics(analysis),
+                'metrics': metrics,
                 'images': self.generated_images,
                 'analysis': analysis
             }
-            
             session_dir = self.results_manager.save_session(session_data)
             
-            # Update visualizations if we have any valid results
+            # Schedule visualization update in main thread
             if any(v is not None for v in analysis.values()):
                 self.root.after(100, lambda: self.update_visualizations(analysis, session_dir))
             

@@ -3132,26 +3132,38 @@ class BrainDecoderGUI:
             trainer.train(train_loader, val_loader)
             self.update_status("Training completed. Generating images...")
             
-            # Generate images for test set
-            test_eeg, test_images, _ = next(iter(train_loader))
+            # Initialize lists to store results
+            self.generated_images = []
+            self.target_images = []
+            self.sleep_stages = []
             
-            # Ensure proper dimensions for EEG data
-            if len(test_eeg.shape) == 3:  # If shape is (batch, channels, time)
-                test_eeg = test_eeg.unsqueeze(1)  # Add extra dimension if needed
-            
+            # Generate images from the entire dataset
+            self.model.eval()
             with torch.no_grad():
-                generated_images, _, _ = self.model(test_eeg.to(self.device), test_images.to(self.device))
-                generated_images = generated_images.cpu().numpy()
-                logger.info(f"Generated {len(generated_images)} images with shape {generated_images.shape}")
+                for eeg_batch, image_batch, stages in tqdm(train_loader, desc="Generating Images"):
+                    if len(eeg_batch.shape) == 3:  # If shape is (batch, channels, time)
+                        eeg_batch = eeg_batch.unsqueeze(1)  # Add extra dimension if needed
+                    
+                    # Generate images
+                    generated_images, _, _ = self.model(eeg_batch.to(self.device), image_batch.to(self.device))
+                    
+                    # Store results
+                    self.generated_images.extend(generated_images.cpu().numpy())
+                    self.target_images.extend(image_batch.numpy())
+                    self.sleep_stages.extend(stages)
+                    
+                    logger.info(f"Running total: {len(self.generated_images)} images generated")
                 
-                self.generated_images = list(generated_images)  # Ensure it's a list
-                self.target_images = list(test_images.numpy())
-                
-                logger.info(f"Stored {len(self.generated_images)} images")
+            logger.info(f"Final total: Generated {len(self.generated_images)} images with shape {generated_images.shape}")
+            
+            # Store all data together for filtering
+            self.all_generated_images = list(zip(self.generated_images, 
+                                            self.target_images, 
+                                            self.sleep_stages))
             
             # Display generated images and switch to images tab
             def update_display():
-                self.display_filtered_grid(self.generated_images)
+                self.filter_images()  # This will trigger display_filtered_grid
                 self.notebook.select(1)  # Select Generated Images tab
                 logger.info("Updated display and switched to images tab")
                 
@@ -3161,6 +3173,7 @@ class BrainDecoderGUI:
             self.perform_analysis()
             
             self.update_status("Processing completed successfully.")
+            
         except Exception as e:
             messagebox.showerror("Error", f"An error occurred during training: {str(e)}")
             logger.error(f"Training error: {str(e)}", exc_info=True)

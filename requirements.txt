@@ -1,0 +1,15 @@
+numpy>=1.19.2
+torch>=1.9.0
+torchvision>=0.10.0
+mne>=1.0.3
+scipy>=1.7.1
+matplotlib>=3.4.3
+opencv-python>=4.5.3
+pillow>=8.3.2
+tqdm>=4.62.3
+pyyaml>=5.4.1
+scikit-learn>=0.24.2
+seaborn>=0.11.2
+tensorboard>=2.7.0
+pytest>=6.2.5
+imageio>=2.9.0

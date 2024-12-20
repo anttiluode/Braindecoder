@@ -1,5 +1,7 @@
 # Braindecoder
 
+(Dont even try to install, it is a mess. Too long for the AIs to understand. They fix one thing and break another.)
+
 Video demo:
 
 [![Video Thumbnail](https://img.youtube.com/vi/UqvO8JjcLMM/maxresdefault.jpg)](https://www.youtube.com/watch?v=UqvO8JjcLMM)

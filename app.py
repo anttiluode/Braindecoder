@@ -1,5 +1,3 @@
-# Dream2Imagev7.py
-
 # =======================
 # Imports
 # =======================
@@ -90,7 +88,7 @@ class Config:
                 'stride': 32,
                 'batch_size': 16,   # Reduced batch size for better stability
                 'learning_rate': 1e-4,  # Reduced learning rate
-                'epochs': 15,
+                'epochs': 1,
                 'hidden_dims': [64, 128, 256, 512],  # Increased network capacity
                 'optimizer_choice': 'AdamW',  # Changed to AdamW
                 'scheduler_step_size': 20,
@@ -111,6 +109,8 @@ class Config:
             },
             'processing': {
                 'eeg_channels': 'all',  # 'all' or list of channel indices
+                'required_channels': ['EEG'],  # Add minimum required channel types
+                'excluded_channels': ['EOG'],  # Channels to exclude by default
                 'min_freq': 1.0,
                 'max_freq': 45.0,
                 'normalize': True
@@ -238,54 +238,68 @@ class EEGExtractor:
         else:
             logger.info("Using all channels")
         
-        # Detect sleep stages using selected channels
+        # Ensure sleep stages are detected immediately after loading data
         data = self.raw.get_data()
-        self.sleep_stages = self._detect_sleep_stages(data)
-    
+        if self.sleep_stages is None:
+            self.sleep_stages = self._detect_sleep_stages(data)
+            if self.sleep_stages is None or len(self.sleep_stages) == 0:
+                logger.error("No sleep stages detected")
+                raise ValueError("Failed to detect sleep stages")
+
+        return self.raw
+
     def _detect_sleep_stages(self, data):
         """Enhanced sleep stage detection using selected channels"""
-        stages = []
-        window_size = int(self.raw.info['sfreq'] * 30)  # 30-second windows
-        
-        for start in range(0, data.shape[1], window_size):
-            window = data[:, start:start + window_size]
-            if window.shape[1] < window_size:
-                break  # Discard incomplete window
-                
-            # Compute features for each channel
-            channel_features = []
-            for ch_idx in range(window.shape[0]):
-                freqs, psd = welch(window[ch_idx], fs=self.raw.info['sfreq'])
-                
-                # Frequency bands
-                delta = np.mean(psd[(freqs >= 0.5) & (freqs <= 4)])
-                theta = np.mean(psd[(freqs >= 4) & (freqs <= 8)])
-                alpha = np.mean(psd[(freqs >= 8) & (freqs <= 13)])
-                beta = np.mean(psd[(freqs >= 13) & (freqs <= 30)])
-                
-                channel_features.append({
-                    'delta': delta,
-                    'theta': theta,
-                    'alpha': alpha,
-                    'beta': beta,
-                    'delta_theta_ratio': delta/theta if theta > 0 else 0,
-                    'theta_alpha_ratio': theta/alpha if alpha > 0 else 0
-                })
+        if data is None or len(data) == 0:
+            logger.error("No data available for sleep stage detection")
+            return None
+
+        try:
+            stages = []
+            window_size = int(self.raw.info['sfreq'] * 30)  # 30-second windows
             
-            # Combine channel features for stage classification
-            avg_delta_theta = np.mean([f['delta_theta_ratio'] for f in channel_features])
-            avg_theta_alpha = np.mean([f['theta_alpha_ratio'] for f in channel_features])
-            
-            # Classify stage
-            if avg_delta_theta > 2:
-                stages.append('deep_sleep')
-            elif avg_theta_alpha > 1.5:
-                stages.append('light_sleep')
-            else:
-                stages.append('rem')
+            for start in range(0, data.shape[1], window_size):
+                window = data[:, start:start + window_size]
+                if window.shape[1] < window_size:
+                    break  # Discard incomplete window
+                    
+                # Compute features for each channel
+                channel_features = []
+                for ch_idx in range(window.shape[0]):
+                    freqs, psd = welch(window[ch_idx], fs=self.raw.info['sfreq'])
+                    
+                    # Frequency bands
+                    delta = np.mean(psd[(freqs >= 0.5) & (freqs <= 4)])
+                    theta = np.mean(psd[(freqs >= 4) & (freqs <= 8)])
+                    alpha = np.mean(psd[(freqs >= 8) & (freqs <= 13)])
+                    beta = np.mean(psd[(freqs >= 13) & (freqs <= 30)])
+                    
+                    channel_features.append({
+                        'delta': delta,
+                        'theta': theta,
+                        'alpha': alpha,
+                        'beta': beta,
+                        'delta_theta_ratio': delta/theta if theta > 0 else 0,
+                        'theta_alpha_ratio': theta/alpha if alpha > 0 else 0
+                    })
                 
-        logger.info(f"Detected sleep stages: {set(stages)} with counts { {stage: stages.count(stage) for stage in set(stages)} }")
-        return stages
+                # Combine channel features for stage classification
+                avg_delta_theta = np.mean([f['delta_theta_ratio'] for f in channel_features])
+                avg_theta_alpha = np.mean([f['theta_alpha_ratio'] for f in channel_features])
+                
+                # Classify stage
+                if avg_delta_theta > 2:
+                    stages.append('deep_sleep')
+                elif avg_theta_alpha > 1.5:
+                    stages.append('light_sleep')
+                else:
+                    stages.append('rem')
+                    
+            logger.info(f"Detected sleep stages: {set(stages)} with counts {dict((stage, stages.count(stage)) for stage in set(stages))}")
+            return stages
+        except Exception as e:
+            logger.error(f"Error in sleep stage detection: {str(e)}")
+            raise
     
     def extract_segments(self, save_dir):
         """Extract and save EEG segments with metadata"""
@@ -2162,6 +2176,27 @@ class BrainDecoderGUI:
         
         return latents
 
+    
+    def get_selected_channels(self):
+        """Get list of selected channels"""
+        selections = self.channel_listbox.curselection()
+        return [self.channel_listbox.get(i) for i in selections]
+    
+    def select_all_channels(self):
+        """Select all channels in the listbox"""
+        self.channel_listbox.select_set(0, tk.END)
+    
+    def clear_channel_selection(self):
+        """Clear all channel selections"""
+        self.channel_listbox.selection_clear(0, tk.END)
+    
+    def update_channel_list(self, channel_names):
+        """Update channel listbox with new channel names"""
+        self.channel_listbox.delete(0, tk.END)
+        for name in channel_names:
+            self.channel_listbox.insert(tk.END, name)
+
+
     def update_visualizations(self, analysis, session_dir):
         """Update visualizations in the analysis tab based on analysis results"""
         try:
@@ -2290,9 +2325,31 @@ class BrainDecoderGUI:
         
         # EEG Channel Selection
         ttk.Label(self.control_frame, text="EEG Channels:").pack(anchor=tk.W, pady=(10,0))
-        ttk.Label(self.control_frame, text="Enter 'all' or comma-separated channel indices (e.g., 2,5,7):").pack(anchor=tk.W)
+        
+        # Channel selection frame
+        self.channel_frame = ttk.Frame(self.control_frame)
+        self.channel_frame.pack(fill=tk.X, pady=5)
+        
+        # Channel listbox with scrollbar
+        self.channel_listbox = tk.Listbox(self.channel_frame, selectmode=tk.MULTIPLE, height=5)
+        channel_scrollbar = ttk.Scrollbar(self.channel_frame, orient=tk.VERTICAL)
+        self.channel_listbox.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+        channel_scrollbar.pack(side=tk.RIGHT, fill=tk.Y)
+        
+        # Configure scrollbar
+        self.channel_listbox.config(yscrollcommand=channel_scrollbar.set)
+        channel_scrollbar.config(command=self.channel_listbox.yview)
+        
+        # Channel selection buttons
+        channel_button_frame = ttk.Frame(self.control_frame)
+        channel_button_frame.pack(fill=tk.X, pady=2)
+        ttk.Button(channel_button_frame, text="Select All", 
+                  command=lambda: self.channel_listbox.select_set(0, tk.END)).pack(side=tk.LEFT, padx=2)
+        ttk.Button(channel_button_frame, text="Clear Selection", 
+                  command=lambda: self.channel_listbox.selection_clear(0, tk.END)).pack(side=tk.LEFT, padx=2)
+        
+        # Keep channels_var for compatibility
         self.channels_var = tk.StringVar(value='all')
-        ttk.Entry(self.control_frame, textvariable=self.channels_var).pack(fill=tk.X, pady=5)
         
         # Processing controls
         ttk.Label(self.control_frame, text="Processing Options:").pack(anchor=tk.W, pady=(10,0))
@@ -2488,7 +2545,7 @@ class BrainDecoderGUI:
         text_widget.config(state=tk.DISABLED)
     
     def browse_file(self):
-        """Open file dialog to select EEG file"""
+        """Open file dialog to select EEG file and display channel information"""
         filename = filedialog.askopenfilename(
             initialdir=str(self.paths.eeg_dir),
             title="Select EEG File",
@@ -2497,7 +2554,43 @@ class BrainDecoderGUI:
         if filename:
             self.file_entry.delete(0, tk.END)
             self.file_entry.insert(0, filename)
-    
+            
+            try:
+                raw = mne.io.read_raw_edf(filename, preload=False, verbose=False)
+                channel_names = raw.ch_names
+                
+                # Update channel listbox
+                self.update_channel_list(channel_names)
+                
+                # Create channel info window
+                info_window = tk.Toplevel(self.root)
+                info_window.title("EEG Channel Information")
+                
+                info_text = f"File: {filename}\n"
+                info_text += f"Number of channels: {len(channel_names)}\n\n"
+                info_text += "Available channels:\n"
+                for idx, name in enumerate(channel_names):
+                    info_text += f"{idx}: {name}\n"
+                    
+                text_widget = tk.Text(info_window, height=20, width=50)
+                text_widget.pack(padx=10, pady=10)
+                text_widget.insert(tk.END, info_text)
+                text_widget.config(state=tk.DISABLED)
+                
+                # Update status
+                self.update_status(f"Loaded {len(channel_names)} channels")
+                
+                # If Pz-Oz channel exists, select it by default
+                for idx, name in enumerate(channel_names):
+                    if 'Pz-Oz' in name:
+                        self.channel_listbox.selection_clear(0, tk.END)
+                        self.channel_listbox.selection_set(idx)
+                        break
+                
+            except Exception as e:
+                messagebox.showerror("Error", f"Failed to read channel information: {str(e)}")
+
+
     def update_progress(self, value):
         """Update progress bar"""
         self.progress_var.set(value)
@@ -2513,11 +2606,19 @@ class BrainDecoderGUI:
         self.eeg_fig.clear()
         ax = self.eeg_fig.add_subplot(111)
         ax.plot(eeg_data.T)
-        channels = self.config.config['processing']['eeg_channels']
-        if channels == 'all':
-            channel_info = "All Channels"
+        
+        # Use stored channel info if available
+        if hasattr(self, 'current_channels') and self.current_channels:
+            channel_info = f"Channel(s): {', '.join(self.current_channels)}"
         else:
-            channel_info = f"Channels: {', '.join(map(str, channels))}"
+            # Fallback to getting from listbox
+            selected_indices = self.channel_listbox.curselection()
+            if selected_indices:
+                selected_names = [self.channel_listbox.get(idx) for idx in selected_indices]
+                channel_info = f"Channel(s): {', '.join(selected_names)}"
+            else:
+                channel_info = "All Channels"
+        
         ax.set_title(f'EEG Signal ({channel_info})')
         ax.set_xlabel('Time')
         ax.set_ylabel('Amplitude')
@@ -2791,16 +2892,29 @@ class BrainDecoderGUI:
         except Exception as e:
             self.update_status(f"Error generating video: {str(e)}")
             logger.error(f"Video generation error: {str(e)}", exc_info=True)
-    
+        
     def extract_eeg_data(self):
         """Extract and organize EEG data segments"""
         edf_file = self.file_entry.get()
-        channels = self.channels_var.get()
+        
+        # Get selected channel indices
+        selected_indices = self.channel_listbox.curselection()
+        self.current_channels = None  # Store current channel selection
+        if not selected_indices:
+            if messagebox.askyesno("No Channels Selected", 
+                                "No channels are selected. Would you like to use all channels?"):
+                channels = 'all'
+            else:
+                return
+        else:
+            # Get selected channel names and store them
+            self.current_channels = [self.channel_listbox.get(idx) for idx in selected_indices]
+            channels = ','.join(str(idx) for idx in selected_indices)
         
         if not edf_file:
             messagebox.showerror("Error", "Please select an EDF file.")
             return
-            
+                
         try:
             self.update_status("Extracting EEG data...")
             extractor = EEGExtractor(edf_file, selected_channels=channels)
@@ -2827,8 +2941,8 @@ class BrainDecoderGUI:
         except Exception as e:
             messagebox.showerror("Error", f"Failed to extract EEG data: {str(e)}")
             logger.error(f"EEG extraction error: {str(e)}", exc_info=True)
-    
-        # Plot EEG data
+        
+        # Plot EEG data with stored channel info
         try:
             data = extractor.raw.get_data()
             self.plot_eeg(data)
@@ -3000,7 +3114,23 @@ class BrainDecoderGUI:
         except Exception as e:
             messagebox.showerror("Error", f"Failed to process EEG data: {str(e)}")
             logger.error(f"EEG processing error: {str(e)}", exc_info=True)
+
+    def validate_channel_selection(self):
+        """Validate that appropriate channels are selected"""
+        selected_channels = self.get_selected_channels()
+        if not selected_channels:
+            messagebox.showerror("Error", "No channels selected")
+            return False
             
+        # Validate that at least one EEG channel (not just EOG) is selected
+        eeg_channels = [ch for ch in selected_channels if not ch.lower().startswith('eog')]
+        if not eeg_channels:
+            messagebox.showwarning("Warning", 
+                "No EEG channels selected. Are you sure you want to continue with only EOG channels?")
+            return messagebox.askyesno("Confirm", "Continue with current channel selection?")
+        
+        return True            
+
     def run_training(self, trainer, train_loader, val_loader):
         """Run the training loop"""
         try:
